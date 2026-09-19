@@ -163,6 +163,42 @@ PEEK_HYST = 12
 SYNC_FRAC = 0.6
 SYNC_MAX_WAIT = 40
 COVER_MAX = 2.5
+# The cover-spot cycle above has been replaced by the edge peek below; set True to bring it back.
+COVER_PEEK = False
+
+# --- the edge peek (what "jiggle peeking" can really be in this engine) --------------------------
+# Every tick each bot decides from the state at the start of the tick, then everyone moves (0.05),
+# then the shots resolve. A shot hits any bot whose 0.25-radius hull crosses the ray, so ducking back
+# one step after being seen does not dodge it: to be safe a bot must be about PEEK_HULL behind the
+# edge of a sightline, several ticks of walking. What does work is timing: the state shows when every
+# enemy shooter can fire again (`next_fire_tick`), and one that has just fired cannot for 60 ticks.
+#
+# So each shooter that is engaged (an enemy within blaster range + PEEK_ENGAGE of its spot) keeps
+# a pair of points near its spot: a HIDE point where its whole body is out of every nearby enemy
+# shooter's sight, and an OUT point, just across the edge, from which it can hit one. It waits at
+# HIDE, pre-aimed, and walks to OUT so as to arrive as its blaster comes ready (PEEK_LEAD ticks of
+# slack), but only if the peek is safe: no enemy shooter that could answer it (one that is ready
+# within PEEK_RESPONSE ticks and can see OUT) or, if some could, at least PEEK_VOLLEY_RATIO times as
+# many of ours are ready (within PEEK_READY_WIN) to trade shots with them. After it fires its
+# cooldown is 60, so it walks straight back to HIDE. Bots pass through each other freely, so
+# there is no fixed formation while this is going on: each is just moving in and out at its edge.
+# The points are searched within PEEK_TETHER of the shooter's spot and refreshed every
+# PEEK_SCAN_TICKS ticks or when its spot moves.
+PEEK_ENGAGE = 3.0
+PEEK_TETHER = 1.8
+PEEK_HULL = 0.32
+PEEK_RESPONSE = 6
+PEEK_VOLLEY_RATIO = 2.0
+PEEK_READY_WIN = 10
+PEEK_SCAN_TICKS = 12
+PEEK_GUARDS = 3
+
+# --- healers: a hub well behind the front ---------------------------------------------------
+# Healers stand in a hub HUB_BEHIND behind the shooters' centre (on the side away from the gate or
+# the enemy), out of sight of the enemy, within HUB_RADIUS of that point. Wounded shooters fall
+# back all the way to it to be healed, so the enemy's fire never reaches the healers first.
+HUB_BEHIND = 4.5
+HUB_RADIUS = 3.0
 RELAYOUT_TICKS = 10
 STICKY_BONUS = 1.5
 FRONT_DEFAULT = 14           # front size before there is a group to size it by (start-up)
@@ -436,6 +472,8 @@ class Plan:
         self.peek = {}           # shooter id -> "out" (on its firing spot) or "cover"
         self.cover_since = {}    # shooter id -> tick it went into cover
         self.in_cover = set()    # shooters that are in cover this tick
+        self.pk = {}             # shooter id -> its current peek points (see the edge peek above)
+        self._einfo = {}         # enemy id -> (predicted x, y, is_shooter, ticks to ready, health, inv)
         self.stance_since = 0    # tick the current late-game stance began
         self.pushers = set()     # shooters pushing the payload (assault stance, no enemy near it)
         self._cap_ref = (0, 0.0)  # (tick, capture) when the payload last moved, for standstills
@@ -569,6 +607,7 @@ class Plan:
         self.peek = {}
         self.cover_since = {}
         self.in_cover = set()
+        self.pk = {}
         self.pressure = [0.0] * len(gates)
         self.weights = [g.prior for g in gates]
         self.last_pressure = -10 ** 9
@@ -1108,6 +1147,16 @@ class Plan:
             (e.id, e.pos.x, e.pos.y) for e in enemies if e.class_ == BotClass.Battle
         ]
         self._clear_cache = {}
+        # For every enemy: where it will be after this tick's move, whether it is a shooter, how many
+        # ticks until its blaster is ready (0 = ready now), its health, and its invulnerability.
+        self._einfo = {}
+        for e in enemies:
+            shooter = e.class_ == BotClass.Battle
+            wait = max(0, e.next_fire_tick - tick) if shooter else 0
+            self._einfo[e.id] = (
+                e.pos.x + e.vel.x, e.pos.y + e.vel.y, shooter, wait, e.health,
+                e.invulnerable_until_tick,
+            )
 
         self._sync_roles(me, tick)
         self._update_mode(state, tick)
@@ -1121,7 +1170,10 @@ class Plan:
         self._plan_defense(me, tick)
         self._update_pushers(me, state, payload)
         self._plan_miners(me, tick)
-        self._update_peek(me, tick)
+        if COVER_PEEK:
+            self._update_peek(me, tick)
+        else:
+            self.in_cover = set()
 
         # 1. where does each bot want to go
         targets = {}
@@ -1146,6 +1198,10 @@ class Plan:
                     v = navigate_to(bot.pos, Vec2(wx, wy))
                     dx, dy = _clip(v.x, v.y, 1.0)
             des[bid] = (dx, dy)
+
+        # Engaged shooters peek in and out at the edge of the enemy's sight instead of standing on
+        # their spot: this overrides where they were going (and takes them off the stuck watch).
+        self._peek_moves(me, targets, des, tick)
 
         # 2. keep out of each other's splash...
         final = self._spread(me, des, conf)
@@ -1205,6 +1261,7 @@ class Plan:
         self.peek.pop(bid, None)
         self.cover_since.pop(bid, None)
         self.in_cover.discard(bid)
+        self.pk.pop(bid, None)
         self.miner_book.drop(bid)
         self.ring_of.pop(bid, None)
         self._release(bid)
@@ -1599,8 +1656,52 @@ class Plan:
         return None
 
     def _take_support_spot(self, bid, gi):
-        """A healer's spot at gate gi: behind the shooters, hidden from the approach, and
-        within heal range of them."""
+        """A healer's place at gate gi: the hub, HUB_BEHIND behind the shooters' centre.
+
+        "Behind" is straight away from the gate (or, in an assault, the payload). Of the free spots
+        within HUB_RADIUS of that point, the least exposed to the enemy shooters in range is taken,
+        nearest the point first, so the healers gather in one out-of-sight cluster. If there is no
+        such spot, the healer settles for the closest safe place behind the shooters.
+        """
+        g = self.gates[gi]
+        mates = [
+            self.fgrid[self.spot_of[b]] for b, gj in self.gate_of.items()
+            if gj == gi and b != bid and self.cls.get(b) == BotClass.Battle and b in self.spot_of
+        ]
+        if not mates:
+            return self._take_spot(bid, gi)
+        mx = sum(p[0] for p in mates) / len(mates)
+        my = sum(p[1] for p in mates) / len(mates)
+        ax, ay = mx - g.cx, my - g.cy
+        n = math.hypot(ax, ay)
+        if n < 1e-6:
+            ax, ay, n = 0.0, 1.0, 1.0
+        hx, hy = mx + ax / n * HUB_BEHIND, my + ay / n * HUB_BEHIND
+        watch = sorted(
+            ((ex, ey) for _, ex, ey in self._threat_pts if _dist(ex, ey, g.cx, g.cy) <= DYN_RANGE),
+            key=lambda p: _dist(p[0], p[1], g.cx, g.cy),
+        )[:8]
+        busy = self._busy()
+        best = None
+        for idx in g.cands:
+            x, y = g.grid[idx]
+            d = _dist(x, y, hx, hy)
+            if d > HUB_RADIUS or idx in busy:
+                continue
+            self._static(g, idx)
+            if g.hug[idx] and g.hug_excludes:
+                continue
+            exposure = g.info[idx][1] + sum(1 for ex, ey in watch if self._exposed(x, y, ex, ey))
+            key = (exposure, d)
+            if best is None or key < best[0]:
+                best = (key, idx)
+        if best is not None:
+            self._assign_spot(bid, best[1])
+            return best[1]
+        return self._take_support_near(bid, gi)
+
+    def _take_support_near(self, bid, gi):
+        """The fallback: behind the shooters and within heal range of them."""
         g = self.gates[gi]
         mates = [
             self.fgrid[self.spot_of[b]] for b, gj in self.gate_of.items()
@@ -1824,17 +1925,20 @@ class Plan:
         near a healer if there is one, and out of the approach's sight where possible."""
         used = self._busy()
         best = None
-        for idx in g.order:
+        # Any spot in the gate will do, not just the ones near the front: the healers are a hub
+        # well behind it, and that is where the wounded need to go.
+        for idx in g.cands:
             if idx in used or idx in front_set:
                 continue
-            x, y = self.fgrid[idx]
+            x, y = g.grid[idx]
             if healer_pts:
                 d = min(_dist(x, y, hx, hy) for hx, hy in healer_pts)
                 if d > reach:
                     continue
-                key = (g.info[idx][1], d, g.rank[idx])
             else:
-                key = (g.info[idx][1], -_dist(x, y, g.cx, g.cy), g.rank[idx])
+                d = -_dist(x, y, g.cx, g.cy)
+            self._static(g, idx)
+            key = (g.info[idx][1], d, g.rank.get(idx, 10 ** 9))
             if best is None or key < best[0]:
                 best = (key, idx)
         return best[1] if best is not None else None
@@ -1967,7 +2071,8 @@ class Plan:
             else:
                 self._take_spot(b, gi)
 
-        self._assign_covers(g, healthy, front_set)
+        if COVER_PEEK:
+            self._assign_covers(g, healthy, front_set)
 
     def _assign_covers(self, g, healthy, front_set):
         """Give each healthy shooter on a front spot a cover spot to reload behind.
@@ -2525,6 +2630,157 @@ class Plan:
         return (best[1], best[2])
 
     # ---------------------------------------------------------------------------------
+    # the edge peek
+    # ---------------------------------------------------------------------------------
+
+    def _exposed(self, x, y, ex, ey):
+        """Could a shot from an enemy at (ex, ey) reach a bot centred at (x, y)? In range, with no
+        wall, deposit or payload in between."""
+        if _dist(x, y, ex, ey) > self.conf.bot.blaster_range + 0.3:
+            return False
+        if not line_of_sight(Vec2(x, y), Vec2(ex, ey)):
+            return False
+        return not self._blocked(x, y, ex, ey)
+
+    def _hull_hidden(self, x, y, ex, ey):
+        """Is a whole bot at (x, y) out of the enemy's line, not just its centre? A shot hits the
+        0.25-radius hull, so the centre and a point PEEK_HULL to each side must all be hidden."""
+        dx, dy = ex - x, ey - y
+        d = math.hypot(dx, dy)
+        if d < 1e-6:
+            return False
+        nx, ny = -dy / d, dx / d
+        for s in (0.0, PEEK_HULL, -PEEK_HULL):
+            if self._exposed(x + nx * s, y + ny * s, ex, ey):
+                return False
+        return True
+
+    def _peek_geometry(self, H0, near, tick):
+        """The HIDE and OUT points for a shooter whose spot is H0, against the enemies `near` it.
+
+        Samples points around H0 (within PEEK_TETHER, and a straight walk from it). OUT points can
+        hit the target (the nearest enemy) and HIDE points are hidden from it and from the nearest
+        few enemy shooters, body and all. The pair chosen is the closest together, near H0, with a
+        longer sightline preferred (up to the blaster's range). Returns None if there is no pair.
+        """
+        rng = self.conf.bot.blaster_range
+        tid = min(near, key=lambda e: _dist(H0[0], H0[1], self._einfo[e][0], self._einfo[e][1]))
+        tx, ty = self._einfo[tid][0], self._einfo[tid][1]
+        guards = sorted(
+            (e for e in near if self._einfo[e][2]),
+            key=lambda e: _dist(H0[0], H0[1], self._einfo[e][0], self._einfo[e][1]),
+        )[:PEEK_GUARDS]
+        gpts = [(self._einfo[e][0], self._einfo[e][1]) for e in guards]
+
+        samples = [H0]
+        for r in (0.5, 1.0, 1.5):
+            for k in range(8):
+                a = 2.0 * math.pi * k / 8.0
+                samples.append((H0[0] + r * math.cos(a), H0[1] + r * math.sin(a)))
+
+        outs, hides = [], []
+        here = Vec2(H0[0], H0[1])
+        for p in samples:
+            if _dist(p[0], p[1], H0[0], H0[1]) > PEEK_TETHER or not self._standable(p[0], p[1]):
+                continue
+            if p != H0 and not corridor_clear(here, Vec2(p[0], p[1])):
+                continue
+            if (_dist(p[0], p[1], tx, ty) <= rng - 0.5 and self._exposed(p[0], p[1], tx, ty)):
+                outs.append(p)
+            if all(self._hull_hidden(p[0], p[1], gx, gy) for gx, gy in gpts):
+                hides.append(p)
+        if not outs or not hides:
+            return None
+
+        pairs = []
+        for o in outs:
+            for h in hides:
+                d = _dist(o[0], o[1], h[0], h[1])
+                if d < 1e-6:
+                    continue
+                score = (d + 0.25 * _dist(h[0], h[1], H0[0], H0[1])
+                         + 0.1 * _dist(o[0], o[1], H0[0], H0[1])
+                         - 0.05 * min(_dist(o[0], o[1], tx, ty), rng - 0.5))
+                pairs.append((score, o, h))
+        pairs.sort()
+        for _, o, h in pairs[:6]:
+            if corridor_clear(Vec2(h[0], h[1]), Vec2(o[0], o[1])):
+                return {"t": tick, "h0": H0, "hide": h, "out": o, "eid": tid}
+        return None
+
+    def _peek_ok(self, out, ready_n):
+        """Is it safe to step out to `out` now: could any enemy shooter answer? An enemy answers if
+        it is ready within PEEK_RESPONSE ticks and can see `out`. Safe if none can, or if we have at
+        least PEEK_VOLLEY_RATIO times as many shooters ready as there are enemies that could."""
+        responders = 0
+        for px, py, shooter, wait, _, _ in self._einfo.values():
+            if shooter and wait <= PEEK_RESPONSE and self._exposed(out[0], out[1], px, py):
+                responders += 1
+        return responders == 0 or ready_n >= PEEK_VOLLEY_RATIO * responders
+
+    def _peek_moves(self, me, targets, des, tick):
+        """Override the movement of every engaged, healthy shooter with the edge peek.
+
+        Each waits at its HIDE point, pre-aimed, and walks to its OUT point to arrive as its blaster
+        comes ready if it is safe to (see `_peek_ok`); after it fires the cooldown sends it straight
+        back. Everything else about it (its spot, its gate, healing) is unchanged: the spot is just
+        the place it peeks from.
+        """
+        if not self._einfo:
+            self.pk = {}
+            return
+        conf = self.conf
+        speed = conf.bot.speed
+        rng = conf.bot.blaster_range
+        shooters = [
+            b for b, r in self.role.items()
+            if r == ROLE_DEFENDER and b in me and me[b].class_ == BotClass.Battle
+            and b not in self.recovering and b not in self.pushers and b in self.spot_of
+        ]
+        ready = {b: max(0, me[b].next_fire_tick - tick) for b in shooters}
+        ready_n = sum(1 for w in ready.values() if w <= PEEK_READY_WIN)
+
+        for b in shooters:
+            H0 = self.fgrid[self.spot_of[b]]
+            bot = me[b]
+            px, py = bot.pos.x, bot.pos.y
+            if _dist(px, py, H0[0], H0[1]) > PEEK_TETHER + 0.6:
+                self.pk.pop(b, None)                # still walking to its spot
+                continue
+            near = [
+                e for e, info in self._einfo.items()
+                if _dist(H0[0], H0[1], info[0], info[1]) <= rng + PEEK_ENGAGE
+            ]
+            if not near:
+                self.pk.pop(b, None)
+                continue
+
+            st = self.pk.get(b)
+            if (st is None or st["h0"] != H0 or tick - st["t"] >= PEEK_SCAN_TICKS
+                    or (not st.get("none") and st["eid"] not in self._einfo)):
+                geo = self._peek_geometry(H0, near, tick)
+                st = geo if geo is not None else {"t": tick, "h0": H0, "none": True, "eid": None}
+                self.pk[b] = st
+            if st.get("none"):
+                continue
+
+            hide, out = st["hide"], st["out"]
+            travel = _dist(hide[0], hide[1], out[0], out[1]) / speed
+            tx, ty = self._einfo[st["eid"]][0], self._einfo[st["eid"]][1]
+            go = (
+                ready[b] <= travel + PEEK_LEAD
+                and self._exposed(out[0], out[1], tx, ty)     # it can still hit its target from OUT
+                and self._peek_ok(out, ready_n)
+            )
+            aim = out if go else hide
+            dx, dy = aim[0] - px, aim[1] - py
+            if math.hypot(dx, dy) > 1e-3:
+                des[b] = _clip(dx / speed, dy / speed, 1.0)
+            else:
+                des[b] = (0.0, 0.0)
+            targets[b] = None                # off the stuck watch: moving in and out is not stuck
+
+    # ---------------------------------------------------------------------------------
     # battle bots
     # ---------------------------------------------------------------------------------
 
@@ -2566,6 +2822,11 @@ class Plan:
             pool = [(ex, ey) for _, ex, ey in self._threat_pts] or [
                 (ex, ey) for _, ex, ey in self._enemy_pts
             ]
+            pk = self.pk.get(bid)
+            if pk and not pk.get("none") and pk.get("eid") in self._einfo:
+                # peeking against a particular enemy: face it now, from cover, so that the moment
+                # the bot steps out it is already aimed and can fire on the first tick
+                pool = [(self._einfo[pk["eid"]][0], self._einfo[pk["eid"]][1])]
             if pool:
                 fx, fy = min(pool, key=lambda p: _dist(nx, ny, p[0], p[1]))
                 ang = _angle_deg(nx, ny, fx, fy)
