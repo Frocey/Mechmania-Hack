@@ -85,8 +85,22 @@ ALWAYS_SPREAD = False
 # extract range is 5 from the bot centre to the deposit's hull; stay comfortably inside it).
 MINER_MAX_DIST = 4.2
 
-# How many of the spots nearest the deposit make up the guard's formation.
+# How many of the spots nearest the deposit make up each pool of the guard's formation.
 GUARD_POOL = 24
+
+# --- extraction guard: calm formation and alert response ---------------------------------
+# Calm (no enemy near the deposit): this share of the guard shooters stand in front of the
+# healer and extractors, the rest behind them.
+GUARD_FRONT_SHARE = 0.5
+# Alert: an enemy within blaster_range + GUARD_ALERT_MARGIN of the deposit. Every guard shooter
+# is then re-planned onto the spots nearest that enemy, each spot taken by whichever shooter is
+# closest to it, so the ones that were at the back run round to help. The plan is redone if the
+# nearest enemy has moved GUARD_REPLAN_DIST, or every GUARD_REPLAN_TICKS. After GUARD_CALM_TICKS
+# without an enemy the shooters go back to their calm posts.
+GUARD_ALERT_MARGIN = 8.0
+GUARD_REPLAN_DIST = 4.0
+GUARD_REPLAN_TICKS = 90
+GUARD_CALM_TICKS = 90
 
 # --- shooters in front ---------------------------------------------------------------
 # Healers and extractors never stand closer to an enemy than our nearest shooter does. When an
@@ -175,6 +189,11 @@ class Plan:
         self.phase2_announced = False
         self.swap_done = False
         self.swap_built = 0
+        self.post = {}          # guard shooter id -> "front" | "rear" (its calm-state post)
+        self.alert = False
+        self.alert_at = (0.0, 0.0)
+        self.alert_tick = 0
+        self.calm = 0
 
     # ---------------------------------------------------------------------------------
     # entry point
@@ -205,19 +224,22 @@ class Plan:
 
         d = state.deposit_other.pos
         self.dep_x, self.dep_y = d.x, d.y
-        miner_spots, front_spots, extra_spots = self._deposit_spots()
-        self.dep_spots = miner_spots + front_spots + extra_spots
-        n_m, n_f = len(miner_spots), len(front_spots)
+        miner_spots, front_spots, flank_spots, rear_spots = self._deposit_spots()
+        self.dep_spots = miner_spots + front_spots + flank_spots + rear_spots
+        n_m, n_f, n_s = len(miner_spots), len(front_spots), len(flank_spots)
         miner_idx = list(range(n_m))
-        front_idx = list(range(n_m, n_m + n_f))      # frontmost first
-        extra_idx = list(range(n_m + n_f, len(self.dep_spots)))
-        # Front to back: shooters take the frontmost guard spots, the healer the guard spot
-        # nearest the extractors, the extractors the spots furthest from the enemy's approach.
-        # Each falls back on the others' spots only if its own run out.
-        self.miner_order = miner_idx + front_idx[::-1] + extra_idx
-        self.escort_order = front_idx + extra_idx + miner_idx
-        self.healer_order = front_idx[::-1] + extra_idx + miner_idx
-        self.escort_only = front_idx + extra_idx  # guard spots only, for flanking
+        front_idx = list(range(n_m, n_m + n_f))                  # frontmost first
+        flank_idx = list(range(n_m + n_f, n_m + n_f + n_s))      # beside the extractors
+        rear_idx = list(range(n_m + n_f + n_s, len(self.dep_spots)))  # behind them
+        # The extractors sit deepest; the healer just in front of them; the shooters are split
+        # between the front (ahead of the healer and extractors) and the rear (behind them).
+        # Each class falls back on the other pools only if its own runs out.
+        self.miner_order = miner_idx + front_idx[::-1] + flank_idx + rear_idx
+        self.healer_order = front_idx[::-1] + flank_idx + rear_idx + miner_idx
+        self.front_order = front_idx + flank_idx + rear_idx + miner_idx
+        self.rear_order = rear_idx + flank_idx + front_idx[::-1] + miner_idx
+        self.guard_idx = front_idx + flank_idx + rear_idx   # every spot a guard shooter may hold
+        self.escort_only = list(self.guard_idx)             # for flanking round a deposit
 
         self.enemy_spawn = (float(MAP_SIZE) - self.spawn[0], float(MAP_SIZE) - self.spawn[1])
 
@@ -236,8 +258,8 @@ class Plan:
 
         print(
             f"[plan] enemy deposit at ({self.dep_x:.1f}, {self.dep_y:.1f}); "
-            f"{len(miner_spots)} mining spots, {len(front_spots) + len(extra_spots)} guard spots, "
-            f"{len(self.base_spots)} base spots"
+            f"{len(miner_spots)} mining spots, guard spots: {len(front_spots)} front / "
+            f"{len(flank_spots)} side / {len(rear_spots)} rear, {len(self.base_spots)} base spots"
         )
         if len(miner_spots) < N_MINERS:
             print(f"[plan] WARNING: only {len(miner_spots)} spots with a sightline to the deposit")
@@ -285,18 +307,19 @@ class Plan:
         taken = {(s[1], s[2]) for s in miners}
         shallowest = min((s[3] for s in miners), default=0.0)
 
-        # Guard: compact around the deposit, and in front of the extractors where the map
-        # allows it. Frontmost first, so shooters fill the front and the healer (which takes
-        # the list backwards) sits just behind them.
-        rest = [s for s in found if (s[1], s[2]) not in taken]
-        in_front = [s for s in rest if s[3] <= shallowest]
-        behind = [s for s in rest if s[3] > shallowest]
-        front = in_front[:GUARD_POOL]
-        extra = in_front[GUARD_POOL:] + behind
-        front.sort(key=lambda s: (s[3], s[0]))
+        # Guard spots, in three pools relative to the extractors' depth: in front of them,
+        # beside them, or behind them (each the nearest GUARD_POOL to the deposit). Frontmost
+        # first, so the front shooters fill the very front and the healer (which takes the
+        # list backwards) sits just ahead of the extractors.
+        deepest = max((s[3] for s in miners), default=0.0)
+        rest = [s for s in found if (s[1], s[2]) not in taken]   # nearest the deposit first
+        front = [s for s in rest if s[3] <= shallowest][:GUARD_POOL]
+        flank = [s for s in rest if shallowest < s[3] <= deepest][:GUARD_POOL]
+        rear = [s for s in rest if s[3] > deepest][:GUARD_POOL]
+        front.sort(key=lambda s: (s[3], s[0]))   # frontmost first
 
         xy = lambda spots: [(s[1], s[2]) for s in spots]
-        return xy(miners), xy(front), xy(extra)
+        return xy(miners), xy(front), xy(flank), xy(rear)
 
     def _base_spots(self):
         bx, by = BASE_POINT
@@ -355,6 +378,7 @@ class Plan:
         self._decide_build(state, conf, action)
 
         # 1. where does each bot want to go
+        self._update_guard(me, tick)
         targets = {}
         for bid, bot in me.items():
             targets[bid] = self._target(bid, bot, state)
@@ -414,6 +438,7 @@ class Plan:
         self.role.pop(bid, None)
         self.cls.pop(bid, None)
         self.aim.pop(bid, None)
+        self.post.pop(bid, None)
         self.dep_book.drop(bid)
         self.base_book.drop(bid)
         self.ring_of.pop(bid, None)
@@ -568,7 +593,7 @@ class Plan:
             elif bot.class_ == BotClass.Healer:
                 order = self.healer_order
             else:
-                order = self.escort_order
+                order = self.front_order if self._post_of(bid) == "front" else self.rear_order
             idx = self.dep_book.assign(bid, order)
             if idx is None:
                 return None
@@ -717,6 +742,77 @@ class Plan:
             return idx
         self.dep_book.of[bid] = new
         return new
+
+    # ---------------------------------------------------------------------------------
+    # the extraction guard: calm posts, and running to where the enemy is
+    # ---------------------------------------------------------------------------------
+
+    def _post_of(self, bid):
+        """A guard shooter's calm-state post, keeping the front/rear split even."""
+        if bid not in self.post:
+            n_front = int(math.ceil(GUARD_FRONT_SHARE * ESCORT_SHOOTER_CAP))
+            fronts = sum(1 for p in self.post.values() if p == "front")
+            self.post[bid] = "front" if fronts < n_front else "rear"
+        return self.post[bid]
+
+    def _update_guard(self, me, tick):
+        """Alert the guard when an enemy comes near the deposit, stand it down afterwards."""
+        guards = sorted(
+            bid for bid, role in self.role.items()
+            if role == ROLE_ESCORT and me[bid].class_ == BotClass.Battle
+        )
+        reach = self.conf.bot.blaster_range + GUARD_ALERT_MARGIN
+        near = None
+        for _, ex, ey in self._enemy_pts:
+            d = math.hypot(ex - self.dep_x, ey - self.dep_y)
+            if d <= reach and (near is None or d < near[0]):
+                near = (d, ex, ey)
+
+        if near is None or not guards:
+            if self.alert:
+                self.calm += 1
+                if self.calm >= GUARD_CALM_TICKS or not guards:
+                    self._stand_down(guards)
+            return
+
+        self.calm = 0
+        _, ex, ey = near
+        moved = _dist(ex, ey, self.alert_at[0], self.alert_at[1]) > GUARD_REPLAN_DIST
+        if not self.alert or moved or tick - self.alert_tick >= GUARD_REPLAN_TICKS:
+            self._plan_defense(guards, me, ex, ey)
+            self.alert = True
+            self.alert_at = (ex, ey)
+            self.alert_tick = tick
+
+    def _plan_defense(self, guards, me, ex, ey):
+        """Send the guard shooters to the spots nearest the enemy, quickest arrival first.
+
+        Spots are taken in order of how near they are to the enemy, and each goes to whichever
+        shooter is closest to it, so the shooters that were at the back run round to help
+        rather than everyone shuffling one place along.
+        """
+        for bid in guards:
+            self.dep_book.of.pop(bid, None)
+        held = set(self.dep_book.of.values())    # the healer's and extractors' spots stay theirs
+        spots = [i for i in self.guard_idx if i not in held]
+        spots.sort(key=lambda i: _dist(self.dep_spots[i][0], self.dep_spots[i][1], ex, ey))
+
+        remaining = set(guards)
+        for i in spots:
+            if not remaining:
+                break
+            sx, sy = self.dep_spots[i]
+            bid = min(remaining, key=lambda b: _dist(me[b].pos.x, me[b].pos.y, sx, sy))
+            remaining.discard(bid)
+            self.dep_book.of[bid] = i
+        # Anyone left over gets a free spot the normal way, in `_target`.
+
+    def _stand_down(self, guards):
+        """Threat gone: everyone goes back to the calm formation."""
+        for bid in guards:
+            self.dep_book.of.pop(bid, None)
+        self.alert = False
+        self.calm = 0
 
     def _exposure(self, x, y):
         """How near the front a spot is: distance to the nearest enemy (smaller = more
