@@ -20,8 +20,8 @@ from . import *
 #     * Every new bot (free or rush) is a shooter that goes to the payload.
 #     * The extraction team stays where it is and is not replaced.
 #
-#     * Just before the endgame (nothing is built after it), a full fleet swaps its extractors
-#       for fighters: see SWAP_EXTRACTORS below.
+#     * Before the endgame (nothing is built after it), a full fleet swaps its extractors for
+#       fighters early enough for them to walk to the payload: see SWAP_EXTRACTORS below.
 #
 #   Always: no two of our bots may sit inside one blaster splash of each other.
 # =====================================================================================
@@ -44,17 +44,21 @@ ESCORT_SHOOTER_CAP = N_OPENING_SHOOTERS
 # If True, rush orders also refill a short-handed guard instead of always going to the base.
 REPLACE_WITH_RUSH = False
 
-# --- last-minute extractor swap --------------------------------------------------------
+# --- pre-endgame extractor swap --------------------------------------------------------
 # Nothing is built once the endgame starts, so a full fleet is stuck with whatever it has. If
-# the fleet is full, the extractors are turned into fighters just before the cut-off: they
-# self-destruct together on one tick (they still mine on that tick), which opens their slots,
-# and the banked tokens rush shooters/healers into them, one per tick, up to the last tick
-# builds are allowed. How many go is limited by the tokens banked (50 per replacement, plus
-# the free build if one is due), and the trigger tick is chosen so the last replacement lands
-# on the final build tick: last_build_tick - swaps - SWAP_MARGIN. The margin covers ticks the
-# bot might be skipped on (compute budget); each margin tick costs a fraction of a token.
+# the fleet is full, the extractors are turned into fighters BEFORE the endgame: they
+# self-destruct together (they still mine on that tick), which opens their slots, and the
+# banked tokens rush shooters/healers into them, one per tick.
+#
+# New bots spawn in our corner and have to walk to the payload, so the swap starts early
+# enough that the last replacement has arrived by the time the endgame begins:
+#     start tick = endgame_start - walk_ticks(spawn -> payload) - swaps - SWAP_MARGIN
+# How many extractors go is limited by the tokens banked (50 per replacement, plus the free
+# build if one is due). A swap that is short of tokens is topped up on later ticks as more
+# tokens arrive, until there are no ticks left to build in.
 SWAP_EXTRACTORS = True
-SWAP_MARGIN = 6
+SWAP_MARGIN = 6            # ticks of slack for a skipped tick (compute budget)
+SWAP_ARRIVAL_SLACK = 40    # extra walking time allowed for turning, detours and spacing
 
 # Base reinforcements: this many shooters per healer.
 BASE_SHOOTERS_PER_HEALER = 3
@@ -391,10 +395,11 @@ class Plan:
 
     def _plan_swap(self, state, conf, me):
         """Ids of extractors to self-destruct this tick so their slots can be refilled."""
-        if not SWAP_EXTRACTORS or self.swap_done:
+        if not SWAP_EXTRACTORS:
             return set()
         tick = state.tick
-        last_build = conf.max_ticks - conf.endgame_ticks - 1   # last tick a rush is honoured
+        endgame_start = conf.max_ticks - conf.endgame_ticks
+        last_build = endgame_start - 1   # last tick a rush is honoured
         if tick >= last_build:
             return set()
         miners = [bid for bid, role in self.role.items() if role == ROLE_MINER]
@@ -411,7 +416,10 @@ class Plan:
         # Free slots are filled first; only the rest need an extractor to make room. One bot
         # is built per tick, so no more swaps than there are ticks left to build in.
         k = min(len(miners), builds - free_slots, last_build - tick)
-        if k <= 0 or tick < last_build - k - SWAP_MARGIN:
+        if k <= 0:
+            return set()
+        # Not yet: the replacements would still be walking when the endgame starts.
+        if tick < endgame_start - self._walk_ticks(state, conf) - k - SWAP_MARGIN:
             return set()
 
         miners.sort(key=lambda bid: (me[bid].health, bid))
@@ -422,6 +430,14 @@ class Plan:
             f"({fab.tokens:.0f} tokens banked) to refill the slots with fighters"
         )
         return chosen
+
+    def _walk_ticks(self, state, conf):
+        """Ticks a bot built at our spawn needs to reach the payload."""
+        p = state.payload_pos()
+        d = path_length(Vec2(self.spawn[0], self.spawn[1]), Vec2(p.x, p.y))
+        if d is None:
+            d = 1.4 * _dist(self.spawn[0], self.spawn[1], p.x, p.y)
+        return int(d / conf.bot.speed) + SWAP_ARRIVAL_SLACK
 
     def _late_class(self):
         """Class for a phase-2 build: shooters only, except the post-swap refills, which
