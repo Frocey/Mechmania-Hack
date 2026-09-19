@@ -60,13 +60,14 @@ Y_MARGIN = 0.35
 # clump shares every hit. Bots do not collide, though, so there is no reason to keep them apart
 # while they MOVE: passing through each other costs nothing, and pushing moving bots apart is what
 # used to block retreats and bend paths. So:
-#   * every standing spot is on a lattice SPOT_SPACING apart (a little inside one splash of each
-#     other, on purpose, so the group is a tight blob rather than a loose scatter), and
+#   * the shooters are one body and the healers another: each is a compact blob, its bots body to
+#     body (a bot is 0.5 across, so SPOT_SPACING = 0.55 is touching, not stacked), and a shot that
+#     splashes 3-5 of them is a fair price for all of them being able to hit the same target;
 #   * a moving bot is never pushed or slowed by anyone; only bots that have SETTLED are nudged
 #     apart, and only when they sit closer than SETTLE_APART (two given the same spot, or landing
-#     on the same point), so nobody ends up stacked.
-SPOT_SPACING = 0.85
-SETTLE_APART = 0.5
+#     on the same point), so nobody ends up stacked on top of another.
+SPOT_SPACING = 0.55
+SETTLE_APART = 0.3
 MOVING = 0.3                # a bot asking to move at least this fast (0..1) counts as moving
 
 # --- extractors ----------------------------------------------------------------------
@@ -156,7 +157,15 @@ COVER_MAX = 2.5
 RELAYOUT_TICKS = 10
 STICKY_BONUS = 1.5
 FRONT_DEFAULT = 14           # front size before there is a group to size it by (start-up)
-ELIG_MAX = 70                # the greedy pick only looks at this many of the best-scoring spots
+ELIG_MAX = 110               # the greedy pick only looks at this many of the best-scoring spots
+# Keeping the shooters one blob: each spot picked earns CLUSTER_W for each already-chosen spot within
+# CLUSTER_R of it (up to 3), so the front fills outwards from one place instead of scattering. Only
+# spots within ROI_R of the group's focus point are considered, so it moves as one body a step at a
+# time; SCAN_STRIDE is how coarsely the whole gate is scanned once, at start-up, to place the focus.
+CLUSTER_W = 1.0
+CLUSTER_R = 0.8
+ROI_R = 5.5
+SCAN_STRIDE = 6
 DYN_RANGE = 24.0             # enemy shooters this close to a gate count as approaching it
 DYN_MAX_ENEMIES = 8
 DYN_WEIGHT = 2.0             # an enemy that is out in the open counts for this many kill points
@@ -227,7 +236,7 @@ HOLD_LINE = [(18.4, 14.5), (18.4, 17.5), (24.5, 17.5)]
 # outside the payload's capture radius). Its spots are HOLD_SPACING apart, a little inside one
 # blaster splash of each other on purpose, so that many bots fit.
 PUSH_REGION_R = 10.0
-HOLD_SPACING = 0.8
+HOLD_SPACING = 0.55
 # The payload is pushed until it is HOLD_CLEAR from every spot on HOLD_LINE (just over its
 # 2.5 capture radius), at which point nobody in the formation can push it any further. The team
 # starts standing off when it is PUSH_LEAD_ARC short of that (it takes a moment to walk out of
@@ -327,6 +336,7 @@ class Gate:
         self.hits = 1
         self.prior = 0.0
         self.order = []           # standing spots (grid indices), best first
+        self.focus = (cx, cy)     # where the group is centred; spots are only looked at near it
         self.rank = {}            # grid index -> place in `order` (0 = the best, front-most spot)
         self.info = {}            # grid index -> (exit points seen, lane points seen), static
         self.grid = []            # the standing spots `order` refers to
@@ -630,31 +640,53 @@ class Plan:
         that blocks shots, like the payload does at its hold point: a line through it is not a
         line of sight.
         """
-        rng = self.conf.bot.blaster_range
         g.grid = grid
         g.solid = solid
-        g.cands = []
-        g.info = {}
-        g.hug = {}
-        g.vis = {}
-        for idx, (x, y) in enumerate(grid):
-            if idx in exclude:
-                continue
-            d = _dist(x, y, g.cx, g.cy)
-            if d < GATE_SPOT_MIN or d > GATE_SPOT_MAX:
-                continue
-            here = Vec2(x, y)
-            seen_pts = tuple(
-                k for k, (ex, ey) in enumerate(g.exit)
-                if _dist(x, y, ex, ey) <= rng - 1.0 and self._sees(here, ex, ey, solid)
-            )
-            seen_lane = sum(1 for lx, ly in g.lane if self._sees(here, lx, ly, solid))
-            g.cands.append(idx)
-            g.vis[idx] = seen_pts
-            g.info[idx] = (len(seen_pts), seen_lane)
-            # Jammed against a wall means a bad angle on anything coming round the corner.
-            g.hug[idx] = not disc_free(here, self.conf.bot.radius + WALL_CLEAR)
+        g.cands = [
+            idx for idx, (x, y) in enumerate(grid)
+            if idx not in exclude and GATE_SPOT_MIN <= _dist(x, y, g.cx, g.cy) <= GATE_SPOT_MAX
+        ]
+        g.info, g.hug, g.vis = {}, {}, {}
+        self._init_focus(g)
         self._rescore(g, [], LANE_WEIGHT)
+
+    def _static(self, g, idx):
+        """The map-only facts about one spot at a gate: which exit points it can hit, how much of
+        the enemy's approach can see it, and whether it is jammed against a wall.
+
+        Worked out the first time a spot is looked at and kept, so only the spots near the group
+        ever cost anything (the lattice is dense, and most of it is never near the action).
+        """
+        if idx in g.info:
+            return
+        rng = self.conf.bot.blaster_range
+        x, y = g.grid[idx]
+        here = Vec2(x, y)
+        seen_pts = tuple(
+            k for k, (ex, ey) in enumerate(g.exit)
+            if _dist(x, y, ex, ey) <= rng - 1.0 and self._sees(here, ex, ey, g.solid)
+        )
+        g.vis[idx] = seen_pts
+        g.info[idx] = (len(seen_pts), sum(1 for lx, ly in g.lane if self._sees(here, lx, ly, g.solid)))
+        # Jammed against a wall means a bad angle on anything coming round the corner.
+        g.hug[idx] = not disc_free(here, self.conf.bot.radius + WALL_CLEAR)
+
+    def _init_focus(self, g):
+        """Where the group starts out: the best spot in a coarse scan of the gate's spots. The
+        group then drifts from there as `_rescore` re-centres it on where it actually stands."""
+        best = None
+        for idx in g.cands[::SCAN_STRIDE]:
+            self._static(g, idx)
+            if g.hug[idx] and g.hug_excludes:
+                continue
+            x, y = g.grid[idx]
+            d = _dist(x, y, g.cx, g.cy)
+            score = g.info[idx][0] - LANE_WEIGHT * g.info[idx][1] + g.bias.get(idx, 0.0)
+            if d > g.far:
+                score -= d - g.far
+            if best is None or score > best[0]:
+                best = (score, x, y)
+        g.focus = (best[1], best[2]) if best is not None else (g.cx, g.cy)
 
     def _sees(self, here, tx, ty, solid):
         """Could a shot from `here` reach (tx, ty): no wall in the way, and not through `solid`."""
@@ -686,9 +718,16 @@ class Plan:
         rng = self.conf.bot.blaster_range
         n_static = len(g.exit)
         weights = [1.0] * n_static + [w for _, _, w in targets]
-        vis, terms, dist, rows, elig = {}, {}, {}, [], []
+        vis, terms, dist, pos, rows, elig = {}, {}, {}, {}, [], []
+        fx, fy = g.focus
         for idx in g.cands:
             x, y = g.grid[idx]
+            # Only the spots around where the group already is are considered: that is what makes
+            # it move as one body, a step at a time, and what keeps this cheap on a dense lattice.
+            if _dist(x, y, fx, fy) > ROI_R and not (sticky and idx in sticky):
+                continue
+            self._static(g, idx)
+            pos[idx] = (x, y)
             v = list(g.vis.get(idx, ()))
             if targets:
                 here = Vec2(x, y)
@@ -715,10 +754,12 @@ class Plan:
         chosen = []
         cover = [0.0] * len(weights)
         avail = set(elig)
+        neighbours = {idx: 0 for idx in avail}      # chosen spots right next to each candidate
         for _ in range(n):
             best = None
             for idx in avail:
                 gain = terms[idx] + sum(weights[t] / (1.0 + cover[t]) for t in vis[idx])
+                gain += CLUSTER_W * min(neighbours[idx], 3)      # stay in one tight group
                 if sticky and idx in sticky:
                     gain += STICKY_BONUS
                 key = (gain, -dist[idx], -idx)
@@ -729,12 +770,21 @@ class Plan:
             avail.discard(idx)
             for t in vis[idx]:
                 cover[t] += 1.0
+            px, py = pos[idx]
+            for j in avail:
+                if _dist(px, py, pos[j][0], pos[j][1]) <= CLUSTER_R:
+                    neighbours[j] += 1
 
         rows.sort(reverse=True)
         picked = set(chosen)
         g.order = chosen + [r[2] for r in rows if r[2] not in picked]
         g.rank = {idx: k for k, idx in enumerate(g.order)}
         g.quality = picked
+        if chosen:
+            # the group's centre moves towards where the chosen spots are, not all the way at once
+            cx = sum(pos[i][0] for i in chosen) / len(chosen)
+            cy = sum(pos[i][1] for i in chosen) / len(chosen)
+            g.focus = (0.6 * fx + 0.4 * cx, 0.6 * fy + 0.4 * cy)
 
     # ---- the payload front -----------------------------------------------------------
 
@@ -854,17 +904,12 @@ class Plan:
         gate.far = 99.0                # no distance limit: the range check does that job
         gate.hug_excludes = False      # hugging a wall costs a little, but is allowed here
         gate.cands = list(range(len(grid)))
+        # the map-only facts (which doorway points a spot can hit) are worked out lazily, by
+        # `_static`, for the spots near the group; only the cheap tie-break is set up here
         for idx, (x, y) in enumerate(grid):
-            here = Vec2(x, y)
-            seen_pts = tuple(
-                k for k, (kx, ky) in enumerate(self.kill_pts)
-                if _dist(x, y, kx, ky) <= rng - 1.0 and self._sees(here, kx, ky, gate.solid)
-            )
-            gate.vis[idx] = seen_pts
-            gate.info[idx] = (len(seen_pts), 0)
-            gate.hug[idx] = not disc_free(here, self.conf.bot.radius + WALL_CLEAR)
             # a faint pull towards the line that was drawn, only to break ties between equals
             gate.bias[idx] = -0.15 * self._poly_dist(x, y, HOLD_LINE)
+        self._init_focus(gate)
         self._rescore(gate, [], LANE_WEIGHT)
         return grid, [gate]
 
