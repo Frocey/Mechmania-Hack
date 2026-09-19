@@ -29,7 +29,8 @@ from . import *
 #       centre, so it wins on timeout, or the enemy dies feeding into the doorways. If the
 #       payload is ever pushed back, the team goes back to pushing it.
 #
-#   Always: no two of our bots may sit inside one blaster splash of each other.
+#   Always: standing spots are on a tight lattice so the group is a compact blob, moving bots pass
+#   through each other, and settled bots are never left stacked (see "spacing" below).
 # =====================================================================================
 
 N_MINERS = 8
@@ -41,10 +42,12 @@ OPENING = (
     + [BotClass.Healer] * N_OPENING_HEALERS
 )
 
-# The defence (and later the payload team) is kept at this many shooters per healer, for every
-# build that joins it: 2 shooters per healer, i.e. one healer for every two shooters. (The 17-bot
-# opening is 6 shooters and 3 healers, exactly that.)
+# The defence (and later the payload team) gets one healer for every BASE_SHOOTERS_PER_HEALER
+# shooters, but never more than HEALER_CAP healers: below the cap a lost healer is replaced (as
+# soon as there are shooters enough), at the cap everything built is a shooter. (The 17-bot
+# opening is 6 shooters and 3 healers.)
 BASE_SHOOTERS_PER_HEALER = 2
+HEALER_CAP = 5
 
 # Our half is y >= Y_LINE (in our own frame; the engine mirrors the world for the other side).
 # Bots stay Y_MARGIN below it until the endgame.
@@ -53,15 +56,18 @@ Y_MARGIN = 0.35
 
 # --- spacing -------------------------------------------------------------------------
 # A shot detonates on the first enemy it meets and hurts every bot whose centre is within
-# `base_blaster_splash_radius + bot.radius` of that impact point. Two bots are safe from a single
-# blast if their centres are at least ~0.8 apart; `hard` adds a margin, and all standing spots
-# are on a lattice `spacing` (~1.05) apart, so a bot at rest is never inside anyone's splash.
-#
-# Spawning is the one place this cannot hold: the engine puts every new bot on the same spot,
-# one per tick. Spacing is therefore enforced whenever an enemy shooter is within
-# `blaster_range + THREAT_MARGIN` of either bot. Set ALWAYS_SPREAD = True to enforce it always.
-THREAT_MARGIN = 6.0
-ALWAYS_SPREAD = False
+# `base_blaster_splash_radius + bot.radius` of that impact point, so a bot standing in a tight
+# clump shares every hit. Bots do not collide, though, so there is no reason to keep them apart
+# while they MOVE: passing through each other costs nothing, and pushing moving bots apart is what
+# used to block retreats and bend paths. So:
+#   * every standing spot is on a lattice SPOT_SPACING apart (a little inside one splash of each
+#     other, on purpose, so the group is a tight blob rather than a loose scatter), and
+#   * a moving bot is never pushed or slowed by anyone; only bots that have SETTLED are nudged
+#     apart, and only when they sit closer than SETTLE_APART (two given the same spot, or landing
+#     on the same point), so nobody ends up stacked.
+SPOT_SPACING = 0.85
+SETTLE_APART = 0.5
+MOVING = 0.3                # a bot asking to move at least this fast (0..1) counts as moving
 
 # --- extractors ----------------------------------------------------------------------
 # Mining spots are searched within this distance of the deposit centre (the engine's own
@@ -116,17 +122,44 @@ REBALANCE_TICKS = 45
 REBALANCE_SLACK = 2
 FLANK_POOL = 40             # how many of a gate's best spots a defender may shift between
 
-# --- rotating wounded shooters out of the line ---------------------------------------------
-# A shooter below RETREAT_FRAC of full health falls back to a spot within heal range of a healer
-# (further back than it stands, out of the enemy's sight where the map allows) and stays there
-# until it has healed to RECOVER_FRAC. The spot it left is taken by the rear-most healthy shooter
-# (any healthy shooter steps up into a free spot at least ROTATE_GAP places better than its own),
-# so the line stays full and the wounded and the healed keep trading places. A bot moves at most
-# once per ROTATE_COOLDOWN ticks, so it cannot flap back and forth.
-RETREAT_FRAC = 0.5
-RECOVER_FRAC = 0.8
-ROTATE_COOLDOWN = 40
-ROTATE_GAP = 3
+# --- combat: a cohesive group that re-lays itself out around the enemy ---------------------------
+# At every gate the shooters do not just fill a fixed list of spots. Every RELAYOUT_TICKS while an
+# enemy shooter is within DYN_RANGE of the gate (and whenever someone is hurt, healed, lost or
+# added), the spots are re-scored against where the enemy actually is, and the group is laid out
+# again: the healthy shooters take the best "front" spots (ones that can see the enemy's exit
+# and are not jammed against a wall), a bot that keeps its spot if it is still a front spot, and
+# anyone else moving to the nearest free one. Wounded shooters do not leave the group: they drop
+# to a reserve spot behind the front, next to a healer, so the enemy's fire lands on the healthy
+# ones and the group as a whole keeps working.
+#
+# The front spots are chosen to put as many shooters as possible on the same targets at the same
+# time: spots are picked one at a time, each for the not-yet-covered targets (the gate's exit points
+# and the enemy shooters in the open) it can hit, so the group ends up as whatever shape covers them
+# best rather than a line. A shooter's current spot gets STICKY_BONUS, so the shape shifts a step at
+# a time as the enemy moves instead of jumping. And the group advances or retreats with the odds:
+# with more healthy shooters than enemy shooters near the gate, spots closer to the gate score
+# better; with fewer, spots further back and out of sight do (see `advance` in Plan._rescore).
+RELAYOUT_TICKS = 10
+STICKY_BONUS = 1.5
+FRONT_DEFAULT = 14           # front size before there is a group to size it by (start-up)
+ELIG_MAX = 70                # the greedy pick only looks at this many of the best-scoring spots
+DYN_RANGE = 24.0             # enemy shooters this close to a gate count as approaching it
+DYN_MAX_ENEMIES = 8
+DYN_WEIGHT = 2.0             # an enemy that is out in the open counts for this many kill points
+MIN_FRONT_SEEN = 3           # a front spot must be able to hit at least this many kill points
+WALL_CLEAR = 0.3             # ... and have this much room beyond the bot's radius (not wall-hugging)
+HUG_PENALTY = 2.0
+FAR_SPOT = 7.5               # spots further than this from the gate lose score and are not front
+
+# How willing the group is to trade blood: the health fraction below which a shooter falls back,
+# the fraction at which it counts as healed and steps up again, how much being seen from the
+# enemy's approach costs a spot, and whether enemies still in the approach count as targets to
+# see (aggressive) or only those already out of the gate (careful). The last number is a standing
+# lean towards advancing (+) or falling back (-), added to the odds-based one (-1..+1 in all).
+#                   retreat  recover  lane weight  targets in the approach  advance lean
+STANCE_HOME = (0.5, 0.8, LANE_WEIGHT, False, 0.0)
+STANCE_HOLD = (0.6, 0.85, LANE_WEIGHT, False, -0.2)    # winning: play it safe
+STANCE_DEFEND = (0.3, 0.6, 0.5, True, 0.3)             # losing: take more risks
 
 # --- shooters in front ---------------------------------------------------------------
 # Healers and extractors never stand closer to an enemy than our nearest shooter does. When an
@@ -169,21 +202,18 @@ WALK_SLACK = 40
 #
 # HOLD_KILL: the two doorways to hold, each as a line the enemy has to cross: the mouth of the
 # doorway north of the payload's corner (y = 13.8, x from 21.6 to 24.5) and the doorway east of
-# it (x = 25.6, y from 15 to 16.8). The firing formation is picked to see both.
+# it (x = 25.6, y from 15 to 16.8). The formation is chosen to hit both, and to put as many
+# shooters as possible on the same enemy at the same time; it is not a line.
 HOLD_KILL = [((21.6, 13.8), (24.5, 13.8)), ((25.6, 15.0), (25.6, 16.8))]
-# HOLD_LINE: where the team stands, an L: down the west side then along the south wall. Shooters
-# fill the line (and, if there are more of them, the rows just in front of it that are still
-# clear of the payload); healers stand behind them.
+# HOLD_LINE: the L that was drawn along the west side and the south wall. It no longer decides
+# where anyone stands (only a faint tie-break); it decides where the PAYLOAD is left: the
+# payload is pushed until it is HOLD_CLEAR from every spot on it.
 HOLD_LINE = [(18.4, 14.5), (18.4, 17.5), (24.5, 17.5)]
-HOLD_BAND = 3.0             # standing spots are searched this close to HOLD_LINE
-# The formation is packed tighter than the rest of the plan so that more bots fit on the line:
-# spots are HOLD_SPACING apart (a little inside one blaster splash of each other, on purpose),
-# and once the main spots are full a second lattice halfway between them takes the overflow.
-# While the team is holding, moving bots only keep HOLD_HARD apart (HOLD_REP is where they start
-# to back off), so they can settle at that spacing without shoving each other out of place.
+# The formation may stand anywhere within PUSH_REGION_R of the doorways (on our side of them, and
+# outside the payload's capture radius). Its spots are HOLD_SPACING apart, a little inside one
+# blaster splash of each other on purpose, so that many bots fit.
+PUSH_REGION_R = 10.0
 HOLD_SPACING = 0.8
-HOLD_HARD = 0.55
-HOLD_REP = 0.7
 # The payload is pushed until it is HOLD_CLEAR from every spot on HOLD_LINE (just over its
 # 2.5 capture radius), at which point nobody in the formation can push it any further. The team
 # starts standing off when it is PUSH_LEAD_ARC short of that (it takes a moment to walk out of
@@ -194,6 +224,25 @@ REPUSH_ARC = 2.0
 HOLD_CLEAR = 2.65
 # Start the march this many ticks before the swap below would begin (0 = together with it).
 PUSH_EARLY_TICKS = 0
+
+# --- the late game: which side of centre is the payload on? -----------------------------
+# From the march on, the team's stance follows the payload's capture value (positive = on the
+# enemy's side of centre, i.e. we are winning the timeout tiebreak):
+#   winning or level: push it to the doorways (above) and HOLD there, careful (STANCE_HOLD);
+#   losing (capture at or below -DEFEND_ENTER): go back and DEFEND our own gates, i.e. the
+#       chokes between the payload and our base, aggressively (STANCE_DEFEND), and keep doing so
+#       until the payload is back at centre (DEFEND_EXIT).
+# Exception: if the enemy has no shooters left, or we out-number them AGGR_OUTNUMBER to 1 (kept
+# until it falls below AGGR_KEEP), a losing team goes and takes the payload instead. A stance is
+# kept for at least STANCE_MIN_TICKS before it can change.
+DEFEND_ENTER = 0.04
+DEFEND_EXIT = 0.0
+AGGR_OUTNUMBER = 2.0
+AGGR_KEEP = 1.3
+STANCE_MIN_TICKS = 120
+# On the march the team stays together: a bot more than MARCH_SPREAD nearer the payload than the
+# group's median waits for the rest instead of walking into the enemy alone.
+MARCH_SPREAD = 4.0
 
 ROLE_MINER = "miner"        # extractor at our deposit
 ROLE_DEFENDER = "defender"  # shooter / healer: holds the gates, later escorts/holds the payload
@@ -265,7 +314,18 @@ class Gate:
         self.prior = 0.0
         self.order = []           # standing spots (grid indices), best first
         self.rank = {}            # grid index -> place in `order` (0 = the best, front-most spot)
-        self.info = {}            # grid index -> (exit points seen, lane points seen)
+        self.info = {}            # grid index -> (exit points seen, lane points seen), static
+        self.grid = []            # the standing spots `order` refers to
+        self.cands = []           # every grid index that may be used at this gate
+        self.hug = {}             # grid index -> True if it is jammed against a wall
+        self.hug_excludes = True  # a wall-hugging spot cannot be a front spot (else just a penalty)
+        self.vis = {}             # grid index -> which exit points it can hit (indices into `exit`)
+        self.bias = {}            # grid index -> fixed score adjustment
+        self.solid = None         # (centre, radius) that blocks shots here, e.g. the payload
+        self.far = FAR_SPOT       # spots further than this from the gate are not front spots
+        self.quality = set()      # the front spots right now (see Plan._rescore)
+        self.last_layout = -10 ** 9
+        self.sig = None
 
 
 class Plan:
@@ -293,7 +353,7 @@ class Plan:
         self.fgrid = []         # ... and the standing spots they refer to
         self.swap_done = False
         self.recovering = set()  # shooters that have fallen back to be healed
-        self.moved_at = {}       # shooter id -> tick of its last rotation move
+        self.stance_since = 0    # tick the current late-game stance began
         self.last_miner_plan = -10 ** 9
         self.hist = {}          # bot id -> recent (x, y, wanted_to_move) for the stuck check
         self.escape = {}        # bot id -> (x, y, until_tick) while it steers out of a jam
@@ -317,10 +377,7 @@ class Plan:
     def _setup(self, state, conf):
         self.conf = conf
         b = conf.bot
-        self.hard = 2.0 * b.radius + b.base_blaster_splash_radius + 0.1   # ~0.9
-        self.rep_start = self.hard + 0.1                                  # ~1.0
-        self.spacing = self.hard + 0.15                                   # ~1.05: rest spacing
-        self.threat_range = b.blaster_range + THREAT_MARGIN
+        self.spacing = SPOT_SPACING                     # lattice spacing of every standing spot
         self.map_max = float(MAP_SIZE) - 0.4
         self.endgame_start = conf.max_ticks - conf.endgame_ticks
         self.y_min = Y_LINE + Y_MARGIN
@@ -552,15 +609,12 @@ class Plan:
         line of sight.
         """
         rng = self.conf.bot.blaster_range
-
-        def sees(here, hx, hy, tx, ty):
-            if not line_of_sight(here, Vec2(tx, ty)):
-                return False
-            if solid is not None and point_seg_dist(solid[0], here, Vec2(tx, ty)) < solid[1]:
-                return False
-            return True
-
-        rows = []
+        g.grid = grid
+        g.solid = solid
+        g.cands = []
+        g.info = {}
+        g.hug = {}
+        g.vis = {}
         for idx, (x, y) in enumerate(grid):
             if idx in exclude:
                 continue
@@ -568,16 +622,97 @@ class Plan:
             if d < GATE_SPOT_MIN or d > GATE_SPOT_MAX:
                 continue
             here = Vec2(x, y)
-            seen_exit = sum(
-                1 for ex, ey in g.exit
-                if _dist(x, y, ex, ey) <= rng - 1.0 and sees(here, x, y, ex, ey)
+            seen_pts = tuple(
+                k for k, (ex, ey) in enumerate(g.exit)
+                if _dist(x, y, ex, ey) <= rng - 1.0 and self._sees(here, ex, ey, solid)
             )
-            seen_lane = sum(1 for lx, ly in g.lane if sees(here, x, y, lx, ly))
-            rows.append((seen_exit - LANE_WEIGHT * seen_lane, -d, idx, seen_exit, seen_lane))
+            seen_lane = sum(1 for lx, ly in g.lane if self._sees(here, lx, ly, solid))
+            g.cands.append(idx)
+            g.vis[idx] = seen_pts
+            g.info[idx] = (len(seen_pts), seen_lane)
+            # Jammed against a wall means a bad angle on anything coming round the corner.
+            g.hug[idx] = not disc_free(here, self.conf.bot.radius + WALL_CLEAR)
+        self._rescore(g, [], LANE_WEIGHT)
+
+    def _sees(self, here, tx, ty, solid):
+        """Could a shot from `here` reach (tx, ty): no wall in the way, and not through `solid`."""
+        target = Vec2(tx, ty)
+        if not line_of_sight(here, target):
+            return False
+        if solid is not None and point_seg_dist(solid[0], here, target) < solid[1]:
+            return False
+        return True
+
+    def _rescore(self, g, targets, lane_w, n_front=None, sticky=None, advance=0.0, avoid=None):
+        """Choose the front spots for a gate, and rank all its spots, counting the enemy too.
+
+        The targets are the gate's own exit points plus `targets`, (x, y, weight) points for the
+        enemy shooters that are out in the open. The front is chosen greedily, one spot at a time:
+        each pick is the spot that adds the most target weight, discounted by how many spots
+        already cover that target (weight / (1 + covered)). That is what puts as many shooters as
+        possible on the same targets at once, and it gives whatever shape does that best, not a line.
+
+        Also counted for each spot: minus `lane_w` per point of the enemy's approach that can see it;
+        minus a penalty for hugging a wall or standing far from the gate; STICKY_BONUS if `sticky`
+        (a set of spots) contains it, so the shape shifts gradually; and `advance` (-1..+1), which
+        prefers spots nearer the gate when positive and further back when negative.
+
+        `n_front` is how many front spots to pick (None: FRONT_DEFAULT); `avoid` is a set of spots
+        that are not available. `g.order` comes out as the front spots in the order they were
+        picked, then everything else best-first; `g.quality` is the front set.
+        """
+        rng = self.conf.bot.blaster_range
+        n_static = len(g.exit)
+        weights = [1.0] * n_static + [w for _, _, w in targets]
+        vis, terms, dist, rows, elig = {}, {}, {}, [], []
+        for idx in g.cands:
+            x, y = g.grid[idx]
+            v = list(g.vis.get(idx, ()))
+            if targets:
+                here = Vec2(x, y)
+                for j, (tx, ty, _) in enumerate(targets):
+                    if _dist(x, y, tx, ty) <= rng - 1.0 and self._sees(here, tx, ty, g.solid):
+                        v.append(n_static + j)
+            d = _dist(x, y, g.cx, g.cy)
+            hug = g.hug.get(idx, False)
+            term = -lane_w * g.info[idx][1] + g.bias.get(idx, 0.0) + advance * 0.4 * (5.0 - d)
+            if hug:
+                term -= HUG_PENALTY
+            if d > g.far:
+                term -= d - g.far
+            vis[idx], terms[idx], dist[idx] = v, term, d
+            seen_w = sum(weights[t] for t in v)
+            rows.append((seen_w + term, -d, idx))
+            if (seen_w >= MIN_FRONT_SEEN and d <= g.far + 1.0
+                    and not (hug and g.hug_excludes) and not (avoid and idx in avoid)):
+                elig.append((seen_w + term, idx))
+
+        # Only the best few are worth the greedy pass (it is the expensive part).
+        elig = [idx for _, idx in sorted(elig, reverse=True)[:ELIG_MAX]]
+        n = min(FRONT_DEFAULT if n_front is None else n_front, len(elig))
+        chosen = []
+        cover = [0.0] * len(weights)
+        avail = set(elig)
+        for _ in range(n):
+            best = None
+            for idx in avail:
+                gain = terms[idx] + sum(weights[t] / (1.0 + cover[t]) for t in vis[idx])
+                if sticky and idx in sticky:
+                    gain += STICKY_BONUS
+                key = (gain, -dist[idx], -idx)
+                if best is None or key > best[0]:
+                    best = (key, idx)
+            idx = best[1]
+            chosen.append(idx)
+            avail.discard(idx)
+            for t in vis[idx]:
+                cover[t] += 1.0
+
         rows.sort(reverse=True)
-        g.order = [r[2] for r in rows]
+        picked = set(chosen)
+        g.order = chosen + [r[2] for r in rows if r[2] not in picked]
         g.rank = {idx: k for k, idx in enumerate(g.order)}
-        g.info = {r[2]: (r[3], r[4]) for r in rows}
+        g.quality = picked
 
     # ---- the payload front -----------------------------------------------------------
 
@@ -662,72 +797,60 @@ class Plan:
         self.hold_solid = (Vec2(hx, hy), self.conf.payload.radius)
 
     def _build_push_front(self):
-        """The formation: one Gate whose spots are ranked for holding both doorways.
+        """The formation: one Gate whose spots are chosen to cover both doorways.
 
-        Candidates are the standing spots within HOLD_BAND of HOLD_LINE that are on our side of
-        the doorways and outside the payload's capture radius. Each is ranked by how many points
-        of the doorways it can hit (with the payload in the way, as it will be) minus twice its
-        distance from the line, so the line itself fills first, best-placed spots first.
+        Candidates are every standing spot within PUSH_REGION_R of the doorways that is on our side
+        of them, outside the payload's capture radius (so nobody in the formation can push the
+        payload on), and a short walk from the doorways (which keeps out spots on the far side of
+        a wall). There is no line: which of them are used, and where, is decided by `_rescore`
+        as the enemy moves, to put as many shooters as possible on the same targets. The payload
+        is the one solid that blocks sight and shots, as it will be at its hold point.
         """
         hx, hy = self.hold_pos
-        grid = []
-        overflow = set()         # indices of the interleaved second lattice
-        half = HOLD_SPACING / 2.0
-        for offset, second in ((0.5, False), (0.5 + half, True)):
-            y = offset
-            while y <= self.map_max:
-                x = offset
-                while x <= self.map_max:
-                    if (self._poly_dist(x, y, HOLD_LINE) <= HOLD_BAND
-                            and _dist(x, y, hx, hy) >= HOLD_CLEAR
-                            and self._on_our_side(x, y, 0.3)
-                            and self._standable(x, y)
-                            and self._on_line_side(x, y)
-                            and self._reachable(x, y)):
-                        if second:
-                            overflow.add(len(grid))
-                        grid.append((x, y))
-                    x += HOLD_SPACING
-                y += HOLD_SPACING
-
         gx = sum(p[0] for p in self.kill_pts) / len(self.kill_pts)
         gy = sum(p[1] for p in self.kill_pts) / len(self.kill_pts)
+        mid = self.kill_pts[len(self.kill_pts) // 2]
+        grid = []
+        y = 0.5
+        while y <= self.map_max:
+            x = 0.5
+            while x <= self.map_max:
+                if (_dist(x, y, gx, gy) <= PUSH_REGION_R
+                        and _dist(x, y, hx, hy) >= HOLD_CLEAR
+                        and self._on_our_side(x, y, 0.3)
+                        and self._standable(x, y)
+                        and self._connected(x, y, mid[0], mid[1])):
+                    grid.append((x, y))
+                x += HOLD_SPACING
+            y += HOLD_SPACING
+
         gate = Gate(gx, gy, [], list(self.kill_pts))
         gate.prior = 1.0
-
         rng = self.conf.bot.blaster_range
-        solid_c, solid_r = self.hold_solid
-        rows = []
+        gate.grid = grid
+        gate.solid = self.hold_solid
+        gate.far = 99.0                # no distance limit: the range check does that job
+        gate.hug_excludes = False      # hugging a wall costs a little, but is allowed here
+        gate.cands = list(range(len(grid)))
         for idx, (x, y) in enumerate(grid):
             here = Vec2(x, y)
-            seen = 0
-            for kx, ky in self.kill_pts:
-                if _dist(x, y, kx, ky) > rng - 1.0:
-                    continue
-                target = Vec2(kx, ky)
-                if not line_of_sight(here, target):
-                    continue
-                if point_seg_dist(solid_c, here, target) < solid_r:
-                    continue
-                seen += 1
-            # The overflow lattice sits close to its neighbours, so it only fills once the
-            # main spots around it are gone.
-            score = seen - 2.0 * self._poly_dist(x, y, HOLD_LINE) - (2.0 if idx in overflow else 0.0)
-            rows.append((score, -_dist(x, y, gx, gy), idx, seen))
-        rows.sort(reverse=True)
-        gate.order = [r[2] for r in rows]
-        gate.rank = {idx: k for k, idx in enumerate(gate.order)}
-        gate.info = {r[2]: (r[3], 0) for r in rows}
+            seen_pts = tuple(
+                k for k, (kx, ky) in enumerate(self.kill_pts)
+                if _dist(x, y, kx, ky) <= rng - 1.0 and self._sees(here, kx, ky, gate.solid)
+            )
+            gate.vis[idx] = seen_pts
+            gate.info[idx] = (len(seen_pts), 0)
+            gate.hug[idx] = not disc_free(here, self.conf.bot.radius + WALL_CLEAR)
+            # a faint pull towards the line that was drawn, only to break ties between equals
+            gate.bias[idx] = -0.15 * self._poly_dist(x, y, HOLD_LINE)
+        self._rescore(gate, [], LANE_WEIGHT)
         return grid, [gate]
 
-    def _on_line_side(self, x, y):
-        """Is (x, y) in the same space as the formation line: not on the far side of a wall?
-
-        A spot must see the nearest point of HOLD_LINE. This is what keeps the bottom arm's
-        neighbours out of the room on the other side of the wall it runs along.
-        """
-        nearest = min(self.line_fine, key=lambda p: _dist(x, y, p[0], p[1]))
-        return line_of_sight(Vec2(x, y), Vec2(nearest[0], nearest[1]))
+    def _connected(self, x, y, tx, ty):
+        """Is (x, y) a short walk from (tx, ty), not round a wall? (Walking distance within
+        1.6x the straight line, plus a little.)"""
+        walk = path_length(Vec2(x, y), Vec2(tx, ty))
+        return walk is not None and walk <= 1.6 * _dist(x, y, tx, ty) + 1.5
 
     # ---- extractor spots -------------------------------------------------------------
 
@@ -810,6 +933,8 @@ class Plan:
         for bid, bot in me.items():
             if bot.class_ != BotClass.Battle:
                 targets[bid] = self._cover_target(bot, targets[bid], me)
+        if self.mode == "push":
+            self._march_together(me, targets, state)
 
         des = {}
         for bid, bot in me.items():
@@ -878,7 +1003,6 @@ class Plan:
         self.hist.pop(bid, None)
         self.escape.pop(bid, None)
         self.recovering.discard(bid)
-        self.moved_at.pop(bid, None)
         self.miner_book.drop(bid)
         self.ring_of.pop(bid, None)
         self._release(bid)
@@ -923,26 +1047,60 @@ class Plan:
         Pushing stops a little before the hold point (the team needs a moment to walk out of
         the payload's capture radius, and it keeps rolling meanwhile), and starts again if the
         payload is knocked back.
-        """
-        if self.mode == "home":
-            if tick < self.push_start:
-                return
-            self.mode = "push"
-            self._use_front(self.push_gates, self.push_grid)
-            for bid in list(self.role):
-                self._release(bid)
-            self.ring_of = {}
-            print(f"[plan] tick {tick}: the march begins -- escorting the payload to the chokes")
 
-        if not self.push_gates:
-            return   # no chokes to hold: keep escorting
-        remaining = (self.hold_capture - state.capture) * self.path_len
-        if self.mode == "push" and remaining <= PUSH_LEAD_ARC:
-            self.mode = "hold"
-            print(f"[plan] tick {tick}: payload at the chokes (capture {state.capture:.3f}) -- holding")
-        elif self.mode == "hold" and remaining >= REPUSH_ARC:
-            self.mode = "push"
-            print(f"[plan] tick {tick}: payload knocked back (capture {state.capture:.3f}) -- pushing")
+        From the march on there is also a fourth stance, "defend": if the payload has ended up on
+        our side of centre (we are losing), the team goes back to our own gates, the chokes between
+        the payload and our base, and fights there aggressively instead of marching out to be
+        picked off one by one. See DEFEND_ENTER and friends at the top of the file.
+        """
+        if self.mode == "home" and tick < self.push_start:
+            return
+        c = state.capture
+        mine = sum(
+            1 for b, r in self.role.items()
+            if r == ROLE_DEFENDER and self.cls.get(b) == BotClass.Battle
+        )
+        theirs = len(self._threat_pts)
+
+        losing = c < DEFEND_EXIT if self.mode == "defend" else c <= -DEFEND_ENTER
+        if losing:
+            # A losing team that clearly out-numbers the enemy (or has nothing left to fight)
+            # takes the payload back rather than waiting for it.
+            ratio = AGGR_KEEP if (self.mode == "push" and c < 0) else AGGR_OUTNUMBER
+            strong = theirs == 0 or mine >= ratio * theirs
+            want = "push" if strong else "defend"
+        else:
+            want = "push" if self.mode in ("home", "defend") else None
+
+        if self.mode == "home":
+            self._enter(want, tick, c, mine, theirs)
+        elif want is not None and want != self.mode and tick - self.stance_since >= STANCE_MIN_TICKS:
+            self._enter(want, tick, c, mine, theirs)
+
+        # Winning or level: push to the doorways, hold there, and push again if knocked back.
+        if self.mode in ("push", "hold") and self.push_gates:
+            remaining = (self.hold_capture - c) * self.path_len
+            if self.mode == "push" and remaining <= PUSH_LEAD_ARC:
+                self.mode = "hold"
+                print(f"[plan] tick {tick}: payload at the chokes (capture {c:.3f}) -- holding")
+            elif self.mode == "hold" and remaining >= REPUSH_ARC:
+                self.mode = "push"
+                print(f"[plan] tick {tick}: payload knocked back (capture {c:.3f}) -- pushing")
+
+    def _enter(self, new, tick, c, mine, theirs):
+        """Switch stance, moving the team onto the right front (our gates, or the payload's)."""
+        old = self.mode
+        self.mode = new
+        self.stance_since = tick
+        if new == "defend":
+            self._use_front(self.home_gates, self.grid)
+        elif old in ("home", "defend"):
+            self._use_front(self.push_gates, self.push_grid)
+            self.ring_of = {}
+        print(
+            f"[plan] tick {tick}: {old} -> {new} (capture {c:.3f}, our shooters {mine} "
+            f"vs their {theirs})"
+        )
 
     # ---------------------------------------------------------------------------------
     # the fabricator
@@ -964,7 +1122,7 @@ class Plan:
                 shooters += 1
             elif self.cls[bid] == BotClass.Healer:
                 healers += 1
-        if shooters >= BASE_SHOOTERS_PER_HEALER * (healers + 1):
+        if healers < HEALER_CAP and shooters >= BASE_SHOOTERS_PER_HEALER * (healers + 1):
             return BotClass.Healer
         return BotClass.Battle
 
@@ -1245,84 +1403,184 @@ class Plan:
                 self.gate_of[h] = gi
                 self._take_support_spot(h, gi)
 
-        self._rotate_wounded(me, tick)
+        self._relayout_all(me, tick)
 
-    def _recovery_spot(self, g, bid, healer_spots, busy):
-        """Where a wounded shooter falls back to: a free spot within heal range of a healer,
-        further back than where it stands, preferring one the approach cannot see."""
-        reach = self.conf.bot.base_heal_range - 0.5
-        here = g.rank.get(self.spot_of[bid], 0)
+    def _stance_params(self):
+        """(retreat fraction, recover fraction, lane weight, aggressive) for the current stance."""
+        if self.mode == "defend":
+            return STANCE_DEFEND
+        if self.mode == "hold":
+            return STANCE_HOLD
+        return STANCE_HOME
+
+    def _release_spot(self, bid):
+        """Give up a standing spot but keep the gate."""
+        idx = self.spot_of.pop(bid, None)
+        if idx is not None and self.taken.get(idx) == bid:
+            del self.taken[idx]
+
+    def _dynamic_targets(self, gi, aggressive):
+        """Enemy shooters a gate's spots should be able to see: (x, y, weight) points.
+
+        Careful: only enemies already out of the gate (near the kill zone), the ones a shooter
+        must be able to hit the moment they peek. Aggressive: also the ones still in the approach
+        within DYN_RANGE/2, so the group starts trading earlier."""
+        g = self.gates[gi]
+        out = []
+        for _, ex, ey in self._threat_pts:
+            nearest = min(range(len(self.gates)),
+                          key=lambda j: _dist(ex, ey, self.gates[j].cx, self.gates[j].cy))
+            if nearest != gi:
+                continue
+            near_exit = min((_dist(ex, ey, px, py) for px, py in g.exit), default=99.0)
+            close = _dist(ex, ey, g.cx, g.cy) <= DYN_RANGE / 2.0
+            if near_exit <= 9.0 or (aggressive and close):
+                out.append((_dist(ex, ey, g.cx, g.cy), ex, ey))
+        out.sort()
+        return [(ex, ey, DYN_WEIGHT) for _, ex, ey in out[:DYN_MAX_ENEMIES]]
+
+    def _reserve_spot(self, g, front_set, healer_pts, reach):
+        """A spot behind the front for a wounded (or surplus) shooter: not a front spot, free,
+        near a healer if there is one, and out of the approach's sight where possible."""
+        used = self._busy()
         best = None
         for idx in g.order:
-            if idx in busy or g.rank.get(idx, 10 ** 9) <= here:
+            if idx in used or idx in front_set:
                 continue
             x, y = self.fgrid[idx]
-            d = min(_dist(x, y, hx, hy) for hx, hy in healer_spots)
-            if d > reach:
-                continue
-            key = (g.info[idx][1], d, g.rank[idx])
+            if healer_pts:
+                d = min(_dist(x, y, hx, hy) for hx, hy in healer_pts)
+                if d > reach:
+                    continue
+                key = (g.info[idx][1], d, g.rank[idx])
+            else:
+                key = (g.info[idx][1], -_dist(x, y, g.cx, g.cy), g.rank[idx])
             if best is None or key < best[0]:
                 best = (key, idx)
         return best[1] if best is not None else None
 
-    def _rotate_wounded(self, me, tick):
-        """Trade wounded shooters for healthy ones so the line stays full and everyone lives longer.
+    def _relayout_all(self, me, tick):
+        """Decide, gate by gate, whether the group needs laying out again, and do it if so.
 
-        1. A shooter under RETREAT_FRAC of full health drops back next to a healer.
-        2. The freed front spot is taken by the rear-most healthy shooter, and a shooter that has
-           healed to RECOVER_FRAC steps up into the best free spot again. Both are the same rule:
-           a healthy shooter moves into a free spot that is ROTATE_GAP places better than its own.
+        A gate is laid out again when its membership or anyone's health class changed (a shooter
+        hurt below the retreat line, healed above the recover line, lost or added), and every
+        RELAYOUT_TICKS while an enemy shooter is close, since then the best spots are moving.
         """
+        retreat, recover, lane_w, aggressive, lean = self._stance_params()
         full = self.conf.bot.health
-        busy = self._busy()
         for gi, g in enumerate(self.gates):
             shooters = [
                 b for b, gj in self.gate_of.items()
-                if gj == gi and b in me and b in self.spot_of and self.cls.get(b) == BotClass.Battle
+                if gj == gi and b in me and self.cls.get(b) == BotClass.Battle
             ]
-            healer_spots = [
-                self.fgrid[self.spot_of[b]] for b, gj in self.gate_of.items()
-                if gj == gi and b in self.spot_of and self.cls.get(b) == BotClass.Healer
+            healers = [
+                b for b, gj in self.gate_of.items()
+                if gj == gi and b in me and self.cls.get(b) == BotClass.Healer
             ]
-
+            # hurt / healed, with a gap between the two lines so a bot does not flicker
             for b in shooters:
-                if b in self.recovering and me[b].health >= RECOVER_FRAC * full:
-                    self.recovering.discard(b)
-
-            # 1. the wounded fall back (at most one per gate per tick, worst first)
-            if healer_spots:
-                for b in sorted(shooters, key=lambda b: me[b].health):
-                    if me[b].health >= RETREAT_FRAC * full:
-                        break
-                    if b in self.recovering or tick - self.moved_at.get(b, -10 ** 9) < ROTATE_COOLDOWN:
-                        continue
-                    spot = self._recovery_spot(g, b, healer_spots, busy)
-                    if spot is None:
-                        continue
-                    busy.discard(self.spot_of[b])
-                    busy.add(spot)
-                    self._assign_spot(b, spot)
+                hp = me[b].health
+                if b in self.recovering:
+                    if hp >= recover * full:
+                        self.recovering.discard(b)
+                elif hp < retreat * full:
                     self.recovering.add(b)
-                    self.moved_at[b] = tick
-                    break
 
-            # 2. the healthy step up into the best free spot (one per gate per tick)
-            free = next((idx for idx in g.order if idx not in busy), None)
-            if free is None:
+            sig = (
+                tuple(sorted(shooters)),
+                tuple(sorted(b for b in shooters if b in self.recovering)),
+                tuple(sorted(healers)),
+                self.mode,
+            )
+            enemy_near = any(
+                _dist(ex, ey, g.cx, g.cy) <= DYN_RANGE for _, ex, ey in self._threat_pts
+            )
+            age = tick - g.last_layout
+            if sig == g.sig and not (enemy_near and age >= RELAYOUT_TICKS):
                 continue
-            ready = [
-                b for b in shooters
-                if b not in self.recovering and me[b].health >= RETREAT_FRAC * full
-                and tick - self.moved_at.get(b, -10 ** 9) >= ROTATE_COOLDOWN
-            ]
-            if not ready:
+            if sig != g.sig and age < 5:
                 continue
-            rear = max(ready, key=lambda b: g.rank.get(self.spot_of[b], 10 ** 9))
-            if g.rank.get(self.spot_of[rear], 10 ** 9) >= g.rank.get(free, 0) + ROTATE_GAP:
-                busy.discard(self.spot_of[rear])
-                busy.add(free)
-                self._assign_spot(rear, free)
-                self.moved_at[rear] = tick
+            g.sig = sig
+            g.last_layout = tick
+            self._relayout(gi, me, lane_w, aggressive, lean)
+
+    def _relayout(self, gi, me, lane_w, aggressive, lean):
+        """Lay one gate's group out again around where the enemy is.
+
+        1. Work out the odds (healthy shooters against enemy shooters near the gate) and from them
+           whether to advance or fall back, then re-choose the front spots against the enemy
+           shooters that are out in the open. A shooter's current spot is favoured, so the shape
+           moves a step at a time.
+        2. Healthy shooters take the front spots (one each). A shooter already on a front spot
+           stays put; the others walk to the nearest free one.
+        3. Healers make way if they were standing on a front spot, then stand behind the shooters.
+        4. Wounded shooters (and any healthy surplus) go to reserve spots behind the front, in
+           heal range of a healer, so the enemy's first shots land on the healthy ones.
+        """
+        g = self.gates[gi]
+        members = [b for b, gj in self.gate_of.items() if gj == gi and b in me]
+        shooters = [b for b in members if self.cls.get(b) == BotClass.Battle]
+        healers = [b for b in members if self.cls.get(b) == BotClass.Healer]
+        healthy = [b for b in shooters if b not in self.recovering]
+        wounded = [b for b in shooters if b in self.recovering]
+
+        # Spots that other bots hold: not this gate's shooters (they are being re-placed) and not
+        # its healers (they make way if they are in the front).
+        mine = {self.spot_of[b] for b in shooters if b in self.spot_of}
+        hs = {self.spot_of[h] for h in healers if h in self.spot_of}
+        busy = self._busy() - mine - hs
+
+        # Odds: more healthy shooters than enemy shooters near the gate means press forward, fewer
+        # means fall back; the stance adds its own lean. (-1 = fall back .. +1 = advance)
+        near = sum(1 for _, ex, ey in self._threat_pts if _dist(ex, ey, g.cx, g.cy) <= DYN_RANGE)
+        advance = lean
+        if near:
+            advance += len(healthy) / near - 1.0
+        advance = max(-1.0, min(1.0, advance))
+        sticky = {self.spot_of[b] for b in healthy if b in self.spot_of}
+        self._rescore(g, self._dynamic_targets(gi, aggressive), lane_w,
+                      n_front=len(healthy), sticky=sticky, advance=advance, avoid=busy)
+        front = [i for i in g.order if i in g.quality and i not in busy][:len(healthy)]
+        front_set = set(front)
+
+        for h in healers:
+            if self.spot_of.get(h) in front_set:
+                self._release_spot(h)
+
+        keep = {b for b in healthy if self.spot_of.get(b) in front_set}
+        movers = [b for b in healthy if b not in keep]
+        for b in movers:
+            self._release_spot(b)
+        held = {self.spot_of[b] for b in keep}
+        for idx in front:
+            if idx in held or not movers:
+                continue
+            x, y = self.fgrid[idx]
+            b = min(movers, key=lambda b: _dist(me[b].pos.x, me[b].pos.y, x, y))
+            movers.remove(b)
+            self._assign_spot(b, idx)
+
+        # healers behind the shooters
+        for h in healers:
+            if h not in self.spot_of:
+                self._take_support_spot(h, gi)
+
+        # the wounded, and any healthy shooter that found no front spot, drop back
+        healer_pts = [self.fgrid[self.spot_of[h]] for h in healers if h in self.spot_of]
+        reach = self.conf.bot.base_heal_range - 0.5
+        for b in wounded + movers:
+            cur = self.spot_of.get(b)
+            if cur is not None and cur not in front_set:
+                if not healer_pts or min(
+                    _dist(self.fgrid[cur][0], self.fgrid[cur][1], hx, hy) for hx, hy in healer_pts
+                ) <= reach:
+                    continue                                   # already tucked in behind the front
+            self._release_spot(b)
+            spot = self._reserve_spot(g, front_set, healer_pts, reach)
+            if spot is not None:
+                self._assign_spot(b, spot)
+            else:
+                self._take_spot(b, gi)
 
     def _plan_miners(self, me, tick):
         """Move extractors away from enemy shooters, as far as mining allows.
@@ -1406,6 +1664,27 @@ class Plan:
         if bot.class_ == BotClass.Battle and bid not in self.recovering:
             idx = self._hold_flank(bid, bot, idx)     # (a wounded bot stays with its healer)
         return self.fgrid[idx]
+
+    def _march_together(self, me, targets, state):
+        """On the march the team arrives as a group, not as a trickle.
+
+        A bot that is more than MARCH_SPREAD nearer the payload than the group's median waits
+        where it is until the rest close up (unless it is already at the payload, or an enemy
+        shooter is close and it is fighting anyway).
+        """
+        ids = [b for b, r in self.role.items()
+               if r == ROLE_DEFENDER and b in me and targets.get(b) is not None]
+        if len(ids) < 3:
+            return
+        p = state.payload_pos()
+        dist = {b: _dist(me[b].pos.x, me[b].pos.y, p.x, p.y) for b in ids}
+        median = sorted(dist.values())[len(ids) // 2]
+        near = self.conf.bot.blaster_range + 4.0
+        for b in ids:
+            if dist[b] > 5.0 and dist[b] < median - MARCH_SPREAD:
+                bx, by = me[b].pos.x, me[b].pos.y
+                if not any(_dist(bx, by, ex, ey) <= near for _, ex, ey in self._threat_pts):
+                    targets[b] = (bx, by)
 
     def _valid_ring(self, state):
         if self._ring_tick == state.tick:
@@ -1611,69 +1890,38 @@ class Plan:
     # ---------------------------------------------------------------------------------
 
     def _spread(self, me, des, conf):
-        speed = conf.bot.speed
-        ids = list(me)
-        # While holding at the doorways the formation is deliberately packed (HOLD_SPACING), so the
-        # keep-apart distances shrink to match; everywhere else the full splash spacing applies.
-        if self.mode == "hold":
-            hard, rep_start = HOLD_HARD, HOLD_REP
-        else:
-            hard, rep_start = self.hard, self.rep_start
+        """Stop settled bots from sitting on top of each other; never get in a moving bot's way.
 
-        threatened = {}
-        for bid in ids:
-            p = me[bid].pos
-            threatened[bid] = any(
-                _dist(p.x, p.y, ex, ey) <= self.threat_range for _, ex, ey in self._threat_pts
-            )
-
-        q = {
-            bid: (me[bid].pos.x + des[bid][0] * speed, me[bid].pos.y + des[bid][1] * speed)
-            for bid in ids
-        }
-
-        # In a narrow spot (a 2-wide gap, a corner) sideways pushing just jams bots against the
-        # walls, so there the rule is a queue instead: a bot only slows for whoever is ahead of
-        # it, and the one in front is never held up.
-        tight = {
-            bid: not disc_free(Vec2(me[bid].pos.x, me[bid].pos.y), self.conf.bot.radius + 0.55)
-            for bid in ids
-        }
-
-        final = {}
-        for i in ids:
+        A bot is "moving" if it is asking to travel (des >= MOVING) and "settled" otherwise. Moving
+        bots are left exactly as asked: they pass through anyone, so a retreat is never blocked and
+        paths are not bent. Only a settled bot is moved, and only away from another settled bot
+        that is closer than SETTLE_APART, e.g. two that were given the same spot or landed on the
+        same point. (Once nudged it walks back towards its spot, so a shared spot ends up as two
+        bots side by side rather than one on top of the other.)
+        """
+        final = {bid: des[bid] for bid in me}
+        settled = [bid for bid in me if math.hypot(des[bid][0], des[bid][1]) < MOVING]
+        for i in settled:
+            px, py = me[i].pos.x, me[i].pos.y
             rx = ry = 0.0
-            slow = 1.0
-            for j in ids:
+            for j in settled:
                 if i == j:
                     continue
-                if not (ALWAYS_SPREAD or threatened[i] or threatened[j]):
-                    continue
-                dx, dy = q[i][0] - q[j][0], q[i][1] - q[j][1]
+                dx, dy = px - me[j].pos.x, py - me[j].pos.y
                 d = math.hypot(dx, dy)
-                if d >= rep_start:
+                if d >= SETTLE_APART:
                     continue
-                if tight[i]:
-                    ahead = des[i][0] * (q[j][0] - q[i][0]) + des[i][1] * (q[j][1] - q[i][1])
-                    if ahead > 0.0:
-                        slow = min(slow, max(0.0, (d - hard) / (rep_start - hard)))
-                    continue
-                sign = 1.0 if i > j else -1.0
                 if d < 1e-4:
                     # Exactly on top of each other: pick a direction both bots agree on.
                     a = math.radians(((min(i, j) * 53 + max(i, j) * 29) * 137.508) % 360.0)
+                    sign = 1.0 if i > j else -1.0
                     ux, uy = sign * math.cos(a), sign * math.sin(a)
                 else:
                     ux, uy = dx / d, dy / d
-                # Sidestep a little as well as backing off, so a column of bots fans out
-                # instead of the rear ones simply stalling behind the front.
-                ux, uy = _rotate(ux, uy, sign * math.radians(40.0))
-                s = min(1.0, (rep_start - d) / (rep_start - hard)) * 1.5
+                s = (SETTLE_APART - d) / SETTLE_APART
                 rx += ux * s
                 ry += uy * s
-            if tight[i]:
-                final[i] = (des[i][0] * slow, des[i][1] * slow)
-            else:
+            if rx or ry:
                 final[i] = _clip(des[i][0] + rx, des[i][1] + ry, 1.0)
         return final
 
