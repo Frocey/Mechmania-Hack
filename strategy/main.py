@@ -139,6 +139,20 @@ FLANK_POOL = 40             # how many of a gate's best spots a defender may shi
 # a time as the enemy moves instead of jumping. And the group advances or retreats with the odds:
 # with more healthy shooters than enemy shooters near the gate, spots closer to the gate score
 # better; with fewer, spots further back and out of sight do (see `advance` in Plan._rescore).
+#
+# Peeking. While an enemy shooter is close (within blaster range + PEEK_MARGIN of the gate), a
+# shooter only stands on its firing spot when its blaster is ready. Each healthy shooter on a front
+# spot is given a COVER spot within COVER_MAX of it that the enemy cannot see. After a shot it
+# retreats to cover for the reload and steps out again once the remaining cooldown is no more than
+# the walk back plus PEEK_LEAD ticks, so it arrives ready to fire. PEEK_HYST stops it flapping at
+# the edge. It also waits (up to SYNC_MAX_WAIT ticks) until SYNC_FRAC of its gate's shooters are
+# ready, so they step out together: one big volley per peek, not a trickle of single shots.
+PEEK_MARGIN = 8.0
+PEEK_LEAD = 6
+PEEK_HYST = 12
+SYNC_FRAC = 0.6
+SYNC_MAX_WAIT = 40
+COVER_MAX = 2.5
 RELAYOUT_TICKS = 10
 STICKY_BONUS = 1.5
 FRONT_DEFAULT = 14           # front size before there is a group to size it by (start-up)
@@ -353,6 +367,10 @@ class Plan:
         self.fgrid = []         # ... and the standing spots they refer to
         self.swap_done = False
         self.recovering = set()  # shooters that have fallen back to be healed
+        self.cover_of = {}       # shooter id -> grid index of its cover spot (hidden, near its own)
+        self.peek = {}           # shooter id -> "out" (on its firing spot) or "cover"
+        self.cover_since = {}    # shooter id -> tick it went into cover
+        self.in_cover = set()    # shooters that are in cover this tick
         self.stance_since = 0    # tick the current late-game stance began
         self.last_miner_plan = -10 ** 9
         self.hist = {}          # bot id -> recent (x, y, wanted_to_move) for the stuck check
@@ -447,6 +465,10 @@ class Plan:
         self.spot_of = {}
         self.taken = {}
         self.recovering = set()
+        self.cover_of = {}
+        self.peek = {}
+        self.cover_since = {}
+        self.in_cover = set()
         self.pressure = [0.0] * len(gates)
         self.weights = [g.prior for g in gates]
         self.last_pressure = -10 ** 9
@@ -923,6 +945,7 @@ class Plan:
         if self.mode != "push":
             self._plan_defense(me, tick)
         self._plan_miners(me, tick)
+        self._update_peek(me, tick)
 
         # 1. where does each bot want to go
         targets = {}
@@ -1003,6 +1026,10 @@ class Plan:
         self.hist.pop(bid, None)
         self.escape.pop(bid, None)
         self.recovering.discard(bid)
+        self.cover_of.pop(bid, None)
+        self.peek.pop(bid, None)
+        self.cover_since.pop(bid, None)
+        self.in_cover.discard(bid)
         self.miner_book.drop(bid)
         self.ring_of.pop(bid, None)
         self._release(bid)
@@ -1255,6 +1282,7 @@ class Plan:
         """Standing spots that are not free: defenders' spots, plus (while the defenders are on
         the home grid) the extractors', which use the same grid."""
         busy = set(self.taken)
+        busy |= set(self.cover_of.values())       # cover spots are reserved too
         if self.fgrid is self.grid:
             busy |= set(self.miner_book.of.values())
         return busy
@@ -1523,6 +1551,8 @@ class Plan:
         healers = [b for b in members if self.cls.get(b) == BotClass.Healer]
         healthy = [b for b in shooters if b not in self.recovering]
         wounded = [b for b in shooters if b in self.recovering]
+        for b in shooters:
+            self.cover_of.pop(b, None)       # cover spots are chosen again below
 
         # Spots that other bots hold: not this gate's shooters (they are being re-placed) and not
         # its healers (they make way if they are in the front).
@@ -1581,6 +1611,109 @@ class Plan:
                 self._assign_spot(b, spot)
             else:
                 self._take_spot(b, gi)
+
+        self._assign_covers(g, healthy, front_set)
+
+    def _assign_covers(self, g, healthy, front_set):
+        """Give each healthy shooter on a front spot a cover spot to reload behind.
+
+        A cover spot is a free spot within COVER_MAX of the shooter's firing spot that the enemy
+        cannot see (the fewest enemy shooters, and none of the approach, have a line to it), and
+        strictly safer than the firing spot itself: if nothing is safer, or nobody can see the
+        firing spot at the moment, the shooter has no cover and simply stays put.
+        """
+        rng = self.conf.bot.blaster_range
+        used = self._busy() | front_set
+        watch = sorted(
+            ((ex, ey) for _, ex, ey in self._threat_pts if _dist(ex, ey, g.cx, g.cy) <= DYN_RANGE),
+            key=lambda p: _dist(p[0], p[1], g.cx, g.cy),
+        )[:DYN_MAX_ENEMIES + 4]
+        cache = {}
+
+        def exposure(idx):
+            e = cache.get(idx)
+            if e is None:
+                x, y = self.fgrid[idx]
+                here = Vec2(x, y)
+                e = g.info[idx][1] + sum(
+                    1 for ex, ey in watch
+                    if _dist(x, y, ex, ey) <= rng and self._sees(here, ex, ey, g.solid)
+                )
+                cache[idx] = e
+            return e
+
+        for b in sorted(healthy):
+            fire = self.spot_of.get(b)
+            if fire is None or fire not in front_set:
+                continue
+            fx, fy = self.fgrid[fire]
+            best = None
+            for idx in g.order:
+                if idx in used:
+                    continue
+                x, y = self.fgrid[idx]
+                d = _dist(x, y, fx, fy)
+                if d > COVER_MAX:
+                    continue
+                key = (exposure(idx), d)
+                if best is None or key < best[0]:
+                    best = (key, idx)
+            if best is not None and best[0][0] < exposure(fire):
+                self.cover_of[b] = best[1]
+                used.add(best[1])
+
+    def _update_peek(self, me, tick):
+        """Decide which shooters are stepping out to fire this tick and which are in cover.
+
+        Only while an enemy shooter is close to the gate. Each shooter with a cover spot has a
+        state, "out" (on its firing spot) or "cover", and changes it on its blaster's cooldown:
+        out -> cover as soon as the cooldown left exceeds the walk to cover plus PEEK_LEAD plus
+        PEEK_HYST (i.e. it has just fired); cover -> out once the cooldown left is within the walk
+        back plus PEEK_LEAD, so it arrives as the blaster comes ready, and provided SYNC_FRAC of the
+        gate's shooters are ready too (or it has waited SYNC_MAX_WAIT ticks), so they go together.
+        """
+        self.in_cover = set()
+        if self.mode == "push":
+            return
+        speed = self.conf.bot.speed
+        rng = self.conf.bot.blaster_range
+        for gi, g in enumerate(self.gates):
+            shooters = [
+                b for b, gj in self.gate_of.items()
+                if gj == gi and b in me and self.cls.get(b) == BotClass.Battle
+                and b not in self.recovering and b in self.spot_of and b in self.cover_of
+            ]
+            if not shooters:
+                continue
+            engaged = any(
+                _dist(ex, ey, g.cx, g.cy) <= rng + PEEK_MARGIN for _, ex, ey in self._threat_pts
+            )
+            if not engaged:
+                for b in shooters:
+                    self.peek[b] = "out"
+                continue
+
+            lead, wait = {}, {}
+            for b in shooters:
+                fx, fy = self.fgrid[self.spot_of[b]]
+                cx, cy = self.fgrid[self.cover_of[b]]
+                lead[b] = _dist(fx, fy, cx, cy) / speed + PEEK_LEAD
+                wait[b] = max(0, me[b].next_fire_tick - tick)
+            ready = {b: wait[b] <= lead[b] for b in shooters}
+            frac = sum(1 for b in shooters if ready[b]) / len(shooters)
+            for b in shooters:
+                state = self.peek.get(b, "out")
+                if state == "out":
+                    if wait[b] > lead[b] + PEEK_HYST:
+                        state = "cover"
+                        self.cover_since[b] = tick
+                elif ready[b] and (
+                    frac >= SYNC_FRAC or tick - self.cover_since.get(b, tick) >= SYNC_MAX_WAIT
+                ):
+                    state = "out"
+                self.peek[b] = state
+                if state == "cover":
+                    self.in_cover.add(b)
 
     def _plan_miners(self, me, tick):
         """Move extractors away from enemy shooters, as far as mining allows.
@@ -1662,6 +1795,8 @@ class Plan:
         if idx is None:
             return None
         if bot.class_ == BotClass.Battle and bid not in self.recovering:
+            if bid in self.in_cover and bid in self.cover_of:
+                return self.fgrid[self.cover_of[bid]]  # reloading: wait out of sight
             idx = self._hold_flank(bid, bot, idx)     # (a wounded bot stays with its healer)
         return self.fgrid[idx]
 
