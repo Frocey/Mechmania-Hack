@@ -31,10 +31,11 @@ SWITCH_TICK = 2000
 N_MINERS = 8
 N_OPENING_SHOOTERS = 8
 N_OPENING_HEALERS = 1
+# Built (and so walking out) front to back: shooters, then the healer, then the extractors.
 OPENING = (
-    [BotClass.Extractor] * N_MINERS
-    + [BotClass.Battle] * N_OPENING_SHOOTERS
+    [BotClass.Battle] * N_OPENING_SHOOTERS
     + [BotClass.Healer] * N_OPENING_HEALERS
+    + [BotClass.Extractor] * N_MINERS
 )
 
 # The extraction guard never holds more than this many shooters; fewer than this and the
@@ -83,6 +84,19 @@ ALWAYS_SPREAD = False
 # Mining spots are searched within this distance of the deposit centre (the engine's own
 # extract range is 5 from the bot centre to the deposit's hull; stay comfortably inside it).
 MINER_MAX_DIST = 4.2
+
+# How many of the spots nearest the deposit make up the guard's formation.
+GUARD_POOL = 24
+
+# --- shooters in front ---------------------------------------------------------------
+# Healers and extractors never stand closer to an enemy than our nearest shooter does. When an
+# enemy is within blaster_range + COVER_TRIGGER of one and a shooter is within COVER_RANGE, the
+# support bot steps to COVER_BEHIND behind that shooter (on the side away from the enemy) if its
+# own spot would be less than COVER_MARGIN further back than the shooter is.
+COVER_TRIGGER = 3.0
+COVER_RANGE = 10.0
+COVER_MARGIN = 0.5
+COVER_BEHIND = 1.3
 
 ROLE_MINER = "miner"      # extractor at the enemy deposit
 ROLE_ESCORT = "escort"    # shooter / healer guarding the miners
@@ -191,23 +205,38 @@ class Plan:
 
         d = state.deposit_other.pos
         self.dep_x, self.dep_y = d.x, d.y
-        miner_spots, escort_spots = self._deposit_spots()
-        self.dep_spots = miner_spots + escort_spots
-        self.miner_order = list(range(len(miner_spots)))
-        self.escort_order = list(range(len(miner_spots), len(self.dep_spots)))
-        self.escort_only = list(self.escort_order)  # guard spots only, for flanking
-        # If a class runs out of its own spots it may fall back on the other's.
-        self.miner_order += self.escort_order
-        self.escort_order += list(range(len(miner_spots)))
+        miner_spots, front_spots, extra_spots = self._deposit_spots()
+        self.dep_spots = miner_spots + front_spots + extra_spots
+        n_m, n_f = len(miner_spots), len(front_spots)
+        miner_idx = list(range(n_m))
+        front_idx = list(range(n_m, n_m + n_f))      # frontmost first
+        extra_idx = list(range(n_m + n_f, len(self.dep_spots)))
+        # Front to back: shooters take the frontmost guard spots, the healer the guard spot
+        # nearest the extractors, the extractors the spots furthest from the enemy's approach.
+        # Each falls back on the others' spots only if its own run out.
+        self.miner_order = miner_idx + front_idx[::-1] + extra_idx
+        self.escort_order = front_idx + extra_idx + miner_idx
+        self.healer_order = front_idx[::-1] + extra_idx + miner_idx
+        self.escort_only = front_idx + extra_idx  # guard spots only, for flanking
+
+        self.enemy_spawn = (float(MAP_SIZE) - self.spawn[0], float(MAP_SIZE) - self.spawn[1])
 
         self.base_spots = self._base_spots()
         self.base_order = list(range(len(self.base_spots)))
+        # Healers wait at the back of the base group: of the spots nearest the rally point,
+        # the ones furthest from the enemy's side of the map.
+        head = self.base_order[:16]
+        self.base_healer_order = (
+            sorted(head, key=lambda i: -_dist(self.base_spots[i][0], self.base_spots[i][1],
+                                              self.enemy_spawn[0], self.enemy_spawn[1]))
+            + self.base_order[16:]
+        )
 
         self.ring_offsets = self._ring_offsets()
 
         print(
             f"[plan] enemy deposit at ({self.dep_x:.1f}, {self.dep_y:.1f}); "
-            f"{len(miner_spots)} mining spots, {len(escort_spots)} guard spots, "
+            f"{len(miner_spots)} mining spots, {len(front_spots) + len(extra_spots)} guard spots, "
             f"{len(self.base_spots)} base spots"
         )
         if len(miner_spots) < N_MINERS:
@@ -232,21 +261,42 @@ class Plan:
         conf = self.conf
         r_min = conf.deposit.radius + conf.bot.radius + 0.35
         dvec = Vec2(self.dep_x, self.dep_y)
+        # "Front" is towards the enemy. Depth is the walking distance from the enemy's spawn:
+        # the smaller it is, the more exposed the spot.
+        enemy_spawn = Vec2(float(MAP_SIZE) - self.spawn[0], float(MAP_SIZE) - self.spawn[1])
         found = []
         for x, y in self._lattice(self.dep_x, self.dep_y, 9.0):
             d = _dist(x, y, self.dep_x, self.dep_y)
             if d < r_min or not self._standable(x, y) or not self._reachable(x, y):
                 continue
-            found.append((d, x, y))
-        found.sort()
-        miners, escorts = [], []
-        for d, x, y in found:
-            if (len(miners) < N_MINERS and d <= MINER_MAX_DIST
-                    and line_of_sight(Vec2(x, y), dvec)):
-                miners.append((x, y))
-            else:
-                escorts.append((x, y))
-        return miners, escorts
+            depth = path_length(enemy_spawn, Vec2(x, y))
+            if depth is None:
+                depth = _dist(x, y, enemy_spawn.x, enemy_spawn.y)
+            found.append((d, x, y, depth))
+        found.sort()   # nearest the deposit first
+
+        # Extractors: of the spots that can mine, the ones deepest behind the guard.
+        eligible = [
+            s for s in found
+            if s[0] <= MINER_MAX_DIST and line_of_sight(Vec2(s[1], s[2]), dvec)
+        ]
+        eligible.sort(key=lambda s: (-s[3], s[0]))
+        miners = eligible[:N_MINERS]
+        taken = {(s[1], s[2]) for s in miners}
+        shallowest = min((s[3] for s in miners), default=0.0)
+
+        # Guard: compact around the deposit, and in front of the extractors where the map
+        # allows it. Frontmost first, so shooters fill the front and the healer (which takes
+        # the list backwards) sits just behind them.
+        rest = [s for s in found if (s[1], s[2]) not in taken]
+        in_front = [s for s in rest if s[3] <= shallowest]
+        behind = [s for s in rest if s[3] > shallowest]
+        front = in_front[:GUARD_POOL]
+        extra = in_front[GUARD_POOL:] + behind
+        front.sort(key=lambda s: (s[3], s[0]))
+
+        xy = lambda spots: [(s[1], s[2]) for s in spots]
+        return xy(miners), xy(front), xy(extra)
 
     def _base_spots(self):
         bx, by = BASE_POINT
@@ -308,6 +358,11 @@ class Plan:
         targets = {}
         for bid, bot in me.items():
             targets[bid] = self._target(bid, bot, state)
+        # ...except that healers and extractors never lead: near an enemy they tuck in
+        # behind our shooters.
+        for bid, bot in me.items():
+            if bot.class_ != BotClass.Battle:
+                targets[bid] = self._cover_target(bot, targets[bid], me)
 
         des = {}
         for bid, bot in me.items():
@@ -474,7 +529,7 @@ class Plan:
         # unambiguously the free bot's; otherwise the free build would just slide a tick.
         if self.built < len(OPENING):
             cls = OPENING[self.built]
-            role = ROLE_MINER if self.built < N_MINERS else ROLE_ESCORT
+            role = ROLE_MINER if cls == BotClass.Extractor else ROLE_ESCORT
             self.built += 1
         elif natural_due:
             cls = BotClass.Battle
@@ -508,7 +563,12 @@ class Plan:
     def _target(self, bid, bot, state):
         role = self.role[bid]
         if role == ROLE_MINER or role == ROLE_ESCORT:
-            order = self.miner_order if role == ROLE_MINER else self.escort_order
+            if role == ROLE_MINER:
+                order = self.miner_order
+            elif bot.class_ == BotClass.Healer:
+                order = self.healer_order
+            else:
+                order = self.escort_order
             idx = self.dep_book.assign(bid, order)
             if idx is None:
                 return None
@@ -516,7 +576,8 @@ class Plan:
                 idx = self._escort_flank(bid, bot, idx)
             return self.dep_spots[idx]
         if role == ROLE_BASE:
-            idx = self.base_book.assign(bid, self.base_order)
+            order = self.base_healer_order if bot.class_ == BotClass.Healer else self.base_order
+            idx = self.base_book.assign(bid, order)
             return self.base_spots[idx] if idx is not None else BASE_POINT
         return self._payload_target(bid, bot, state)
 
@@ -560,7 +621,11 @@ class Plan:
         for idx, (x, y, k) in valid.items():
             if idx in used:
                 continue
-            key = (0 if k <= 1 else 1, _dist(bot.pos.x, bot.pos.y, x, y))
+            # Shooters take the exposed spots (nearest the enemy), healers the sheltered ones;
+            # a small pull towards the bot's own position breaks ties.
+            expo = self._exposure(x, y)
+            lead = expo if bot.class_ == BotClass.Battle else -expo
+            key = (0 if k <= 1 else 1, lead + 0.02 * _dist(bot.pos.x, bot.pos.y, x, y))
             if best is None or key < best[0]:
                 best = (key, idx)
         if best is None:
@@ -652,6 +717,58 @@ class Plan:
             return idx
         self.dep_book.of[bid] = new
         return new
+
+    def _exposure(self, x, y):
+        """How near the front a spot is: distance to the nearest enemy (smaller = more
+        exposed), or to the enemy's spawn when none is on the field."""
+        best = None
+        for _, ex, ey in self._enemy_pts:
+            d = math.hypot(ex - x, ey - y)
+            if best is None or d < best:
+                best = d
+        if best is None:
+            best = _dist(x, y, self.enemy_spawn[0], self.enemy_spawn[1])
+        return best
+
+    def _cover_target(self, bot, target, me):
+        """Keep a healer or extractor behind our shooters.
+
+        Returns `target` unchanged unless an enemy is close and that target would put the bot
+        closer to it than our frontmost nearby shooter, in which case it returns a spot just
+        behind that shooter. It is a pure function of where everyone stands, so a bot that has
+        tucked in stays tucked in instead of oscillating back to its old spot.
+        """
+        px, py = bot.pos.x, bot.pos.y
+        reach = self.conf.bot.blaster_range + COVER_TRIGGER
+        nearest = None
+        for _, ex, ey in self._enemy_pts:
+            d = math.hypot(ex - px, ey - py)
+            if d <= reach and (nearest is None or d < nearest[0]):
+                nearest = (d, ex, ey)
+        if nearest is None:
+            return target
+        _, ex, ey = nearest
+
+        shooters = [
+            b for b in me.values()
+            if b.class_ == BotClass.Battle and _dist(b.pos.x, b.pos.y, px, py) <= COVER_RANGE
+        ]
+        if not shooters:
+            return target
+        front = min(shooters, key=lambda b: _dist(b.pos.x, b.pos.y, ex, ey))
+        d_front = _dist(front.pos.x, front.pos.y, ex, ey)
+        if d_front < 1e-6:
+            return target
+
+        tx, ty = target if target is not None else (px, py)
+        if d_front + COVER_MARGIN <= _dist(tx, ty, ex, ey):
+            return target   # already behind a shooter
+
+        ux, uy = (front.pos.x - ex) / d_front, (front.pos.y - ey) / d_front
+        cx, cy = front.pos.x + ux * COVER_BEHIND, front.pos.y + uy * COVER_BEHIND
+        if not self._standable(cx, cy):
+            return target
+        return (cx, cy)
 
     def _detour(self, ax, ay, tx, ty):
         """Where to steer this tick: the target, or a waypoint that rounds a solid in the way.
