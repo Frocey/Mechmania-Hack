@@ -4,117 +4,111 @@ import traceback
 from . import *
 
 # =====================================================================================
-# The plan
+# The plan: hold our own extractor behind choke points, then push the payload
 #
-#   Phase 1 (tick < SWITCH_TICK)
+#   Until the endgame starts
 #     * Opening: the free tick-0 bot + 16 rush orders (the 800 starting tokens) = 17 bots:
-#       8 extractors, 8 shooters, 1 healer. All 17 walk to the ENEMY deposit; the extractors
-#       mine it (8 slots) and the shooters/healer guard them and never leave.
-#     * Every later free (timer) build is a shooter. It joins the guard only while the guard
-#       has fewer than ESCORT_SHOOTER_CAP shooters (so dead guards get replaced, and the
-#       guard never grows past the cap); otherwise it waits at our base.
-#     * Every rush order bought with stolen tokens is a shooter/healer at a 3:1 ratio that
-#       stays at our base.
-#   Phase 2 (tick >= SWITCH_TICK)
-#     * Everything waiting at the base marches to the payload and holds it.
-#     * Every new bot (free or rush) is a shooter that goes to the payload.
-#     * The extraction team stays where it is and is not replaced.
-#
-#     * Before the endgame (nothing is built after it), a full fleet swaps its extractors for
-#       fighters early enough for them to walk to the payload: see SWAP_EXTRACTORS below.
+#       8 extractors, 8 shooters, 1 healer. The extractors mine OUR deposit.
+#     * Every build after that (free or rush) replaces a lost extractor first, so there are
+#       always 8 mining; anything else is a shooter or healer at 3:1 for the defence.
+#     * The defence holds the "gates": the narrow places the enemy has to come through to
+#       reach our half. At each gate the shooters stand where they can see the spot the
+#       enemy steps out of but the approach behind it cannot see them, so the enemy is
+#       fed through one at a time into everyone's fire. Healers stand behind the shooters.
+#       Which gate gets the men follows where the enemy actually is.
+#     * Nobody goes north of the line y = Y_LINE (the far side of the wall that closes off
+#       our half).
+#   Around the time a full fleet turns its extractors into fighters (see SWAP_EXTRACTORS; nothing
+#   can be built once the endgame starts), the whole team leaves home for the payload:
+#     * It escorts the payload forward, shooters in front, but only as far as the two choke
+#       points nearest it (PAYLOAD_CHOKES: the doorways the enemy has to come through to reach
+#       the payload). Then it stops pushing and holds: two firing lines, one facing each choke,
+#       shooters where they can hit the spot the enemy steps out of and healers behind them.
+#     * That position is held to the end of the match: the payload sits on the enemy's side of
+#       centre, so it wins on timeout, or the enemy dies feeding into the chokes. If the payload
+#       is ever pushed back, the team goes back to pushing it.
 #
 #   Always: no two of our bots may sit inside one blaster splash of each other.
 # =====================================================================================
 
-SWITCH_TICK = 2000
-
 N_MINERS = 8
 N_OPENING_SHOOTERS = 8
 N_OPENING_HEALERS = 1
-# Built (and so walking out) front to back: shooters, then the healer, then the extractors.
 OPENING = (
-    [BotClass.Battle] * N_OPENING_SHOOTERS
+    [BotClass.Extractor] * N_MINERS
+    + [BotClass.Battle] * N_OPENING_SHOOTERS
     + [BotClass.Healer] * N_OPENING_HEALERS
-    + [BotClass.Extractor] * N_MINERS
 )
 
-# The extraction guard never holds more than this many shooters; fewer than this and the
-# next free build is sent to refill it (phase 1 only).
-ESCORT_SHOOTER_CAP = N_OPENING_SHOOTERS
-
-# If True, rush orders also refill a short-handed guard instead of always going to the base.
-REPLACE_WITH_RUSH = False
-
-# --- pre-endgame extractor swap --------------------------------------------------------
-# Nothing is built once the endgame starts, so a full fleet is stuck with whatever it has. If
-# the fleet is full, the extractors are turned into fighters BEFORE the endgame: they
-# self-destruct together (they still mine on that tick), which opens their slots, and the
-# banked tokens rush shooters/healers into them, one per tick.
-#
-# New bots spawn in our corner and have to walk to the payload, so the swap starts early
-# enough that the last replacement has arrived by the time the endgame begins:
-#     start tick = endgame_start - walk_ticks(spawn -> payload) - swaps - SWAP_MARGIN
-# How many extractors go is limited by the tokens banked (50 per replacement, plus the free
-# build if one is due). A swap that is short of tokens is topped up on later ticks as more
-# tokens arrive, until there are no ticks left to build in.
-SWAP_EXTRACTORS = True
-SWAP_MARGIN = 6            # ticks of slack for a skipped tick (compute budget)
-SWAP_ARRIVAL_SLACK = 40    # extra walking time allowed for turning, detours and spacing
-
-# Lost extractors are replaced (up to N_MINERS) so the income keeps flowing, ahead of every other
-# build, until a replacement could no longer arrive and mine for EXTRACTOR_MIN_MINE_TICKS before
-# the swap below (or the endgame). It also waits while an enemy shooter is at the deposit.
-REPLACE_EXTRACTORS = True
-EXTRACTOR_MIN_MINE_TICKS = 300
-
-# The attack pool (base bots, then payload bots) is kept at this many shooters per healer, for
-# every build that joins it: free builds, rush orders and the post-swap refills alike.
+# The defence (and later the payload team) is kept at this many shooters per healer, for every
+# build that joins it.
 BASE_SHOOTERS_PER_HEALER = 3
 
-# Where the reinforcements wait (our half, between our spawn corner and our goal).
-BASE_POINT = (6.0, 28.0)
+# Our half is y >= Y_LINE (in our own frame; the engine mirrors the world for the other side).
+# Bots stay Y_MARGIN below it until the endgame.
+Y_LINE = 24.0
+Y_MARGIN = 0.35
 
 # --- spacing -------------------------------------------------------------------------
 # A shot detonates on the first enemy it meets and hurts every bot whose centre is within
-# `base_blaster_splash_radius + bot.radius` of that impact point. Working through the geometry
-# (impact lies on the hull, 0.25 from the target's centre), two bots stay safe from a single
-# blast as long as their centres are at least ~0.8 apart. `hard` adds a margin on top.
+# `base_blaster_splash_radius + bot.radius` of that impact point. Two bots are safe from a single
+# blast if their centres are at least ~0.8 apart; `hard` adds a margin, and all standing spots
+# are on a lattice `spacing` (~1.05) apart, so a bot at rest is never inside anyone's splash.
 #
-# Spawning is the one place this cannot hold: the engine puts every new bot on the exact
-# same spot, and one bot arrives per tick. Spacing is therefore enforced whenever an enemy is
-# within `blaster_range + THREAT_MARGIN` of either bot; further away nothing can shoot us, so
-# a freshly-spawned convoy is allowed to walk out of the corner instead of stretching into a
-# 17-bot conga line. Set ALWAYS_SPREAD = True to enforce it unconditionally.
+# Spawning is the one place this cannot hold: the engine puts every new bot on the same spot,
+# one per tick. Spacing is therefore enforced whenever an enemy shooter is within
+# `blaster_range + THREAT_MARGIN` of either bot. Set ALWAYS_SPREAD = True to enforce it always.
 THREAT_MARGIN = 6.0
 ALWAYS_SPREAD = False
 
+# --- extractors ----------------------------------------------------------------------
 # Mining spots are searched within this distance of the deposit centre (the engine's own
 # extract range is 5 from the bot centre to the deposit's hull; stay comfortably inside it).
 MINER_MAX_DIST = 4.2
 
-# How many of the spots nearest the deposit make up each pool of the guard's formation.
-GUARD_POOL = 24
+# Lost extractors are replaced (up to N_MINERS) ahead of every other build, until a replacement
+# could no longer arrive and mine for EXTRACTOR_MIN_MINE_TICKS before the swap below.
+REPLACE_EXTRACTORS = True
+EXTRACTOR_MIN_MINE_TICKS = 300
 
-# --- extraction guard: calm formation and alert response ---------------------------------
-# Calm (no enemy near the deposit): this share of the guard shooters stand in front of the
-# healer and extractors, the rest behind them.
-GUARD_FRONT_SHARE = 0.5
-# Alert: an enemy within blaster_range + GUARD_ALERT_MARGIN of the deposit. Every guard shooter
-# is then re-planned onto the spots nearest that enemy, each spot taken by whichever shooter is
-# closest to it, so the ones that were at the back run round to help. The plan is redone if the
-# nearest enemy has moved GUARD_REPLAN_DIST, or every GUARD_REPLAN_TICKS. After GUARD_CALM_TICKS
-# without an enemy the shooters go back to their calm posts.
-# Collapse: if no enemy comes near the deposit for COLLAPSE_QUIET_TICKS in a row (and the game
-# is past COLLAPSE_AFTER_TICK), the guard's shooters and healer walk to the payload and join the
-# attack; the extractors stay and keep mining. If an enemy turns up at the deposit while they
-# are still within RECALL_RANGE of it, they go back to guarding. Keep COLLAPSE_AFTER_TICK at or
-# after SWITCH_TICK: before it, free builds refill the guard, which would fight the collapse.
-COLLAPSE_ENABLED = True
-COLLAPSE_AFTER_TICK = SWITCH_TICK
-COLLAPSE_QUIET_TICKS = 300
-RECALL_RANGE = 14.0
+# --- gates (choke points) --------------------------------------------------------------
+# Found from the map: routes are traced from a grid of points outside our half to our deposit;
+# where each route crosses Y_LINE we look for its narrowest spot (the gate).
+GATE_ORIGIN_STEP = 4        # spacing of the grid the routes start from
+GATE_MERGE_DIST = 3.0       # gates closer than this are the same gate
+GATE_BEFORE = 3             # samples (0.5 apart) before the crossing that may hold the gate
+GATE_AFTER = 30             # ... and after it
+GATE_TIE = 0.3              # the first spot within this of the narrowest width is the gate
+GATE_LANE = 16              # samples of approach behind the gate that must not see the defenders
+GATE_EXIT = 6               # samples of route from the gate on: the kill zone
+GATE_SPOT_MIN = 2.5         # defenders stand this far from the gate ...
+GATE_SPOT_MAX = 9.0         # ... and no further than this
+LANE_WEIGHT = 2.0           # how much being seen from the approach costs a spot
+MAX_GATES = 5
+# Used only if no gate can be found from the map: (x, y) of each gate, in our frame.
+GATE_SEEDS = [(30.5, 28.5), (22.5, 23.5), (1.5, 23.5)]
 
-GUARD_ALERT_MARGIN = 4.0
+# Which gate gets the defenders. Every enemy shooter counts towards the gate it would reach
+# first (nearer = heavier); the counts are smoothed and added to a prior that favours the gate
+# on the enemy's shortest route to our deposit. Defenders are only moved between gates when a
+# gate is REBALANCE_SLACK men short, and at most once per REBALANCE_TICKS.
+PRESSURE_TICKS = 15
+PRESSURE_RANGE = 90.0
+PRIOR_PRIMARY = 0.5
+PRIOR_WEIGHT = 1.0
+REBALANCE_TICKS = 45
+REBALANCE_SLACK = 2
+FLANK_POOL = 40             # how many of a gate's best spots a defender may shift between
+
+# --- shooters in front ---------------------------------------------------------------
+# Healers and extractors never stand closer to an enemy than our nearest shooter does. When an
+# enemy shooter is within blaster_range + COVER_TRIGGER of one and one of ours is within
+# COVER_RANGE, the support bot steps to COVER_BEHIND behind that shooter (on the side away from
+# the enemy) if its own spot would be less than COVER_MARGIN further back than the shooter is.
+COVER_TRIGGER = 3.0
+COVER_RANGE = 10.0
+COVER_MARGIN = 0.5
+COVER_BEHIND = 1.3
 
 # --- stuck detection -----------------------------------------------------------------------
 # Expected travel is 0.05 a tick, i.e. 2.0 over STUCK_WINDOW ticks; under STUCK_MIN_MOVE means
@@ -123,24 +117,42 @@ STUCK_WINDOW = 40
 STUCK_MIN_MOVE = 0.5
 STUCK_ESCAPE_TICKS = 60
 STUCK_CLEAR_DIST = 2.0
-GUARD_REPLAN_DIST = 4.0
-GUARD_REPLAN_TICKS = 90
-GUARD_CALM_TICKS = 90
 
-# --- shooters in front ---------------------------------------------------------------
-# Healers and extractors never stand closer to an enemy than our nearest shooter does. When an
-# enemy is within blaster_range + COVER_TRIGGER of one and a shooter is within COVER_RANGE, the
-# support bot steps to COVER_BEHIND behind that shooter (on the side away from the enemy) if its
-# own spot would be less than COVER_MARGIN further back than the shooter is.
-COVER_TRIGGER = 3.0
-COVER_RANGE = 10.0
-COVER_MARGIN = 0.5
-COVER_BEHIND = 1.3
+# --- pre-endgame extractor swap --------------------------------------------------------
+# Nothing is built once the endgame starts, so a full fleet is stuck with whatever it has. If
+# the fleet is full, the extractors are turned into fighters just before that: they
+# self-destruct together (they still mine on that tick), which opens their slots, and the banked
+# tokens rush shooters/healers into them, one per tick. How many go is limited by the tokens
+# banked (50 per replacement, plus the free build if one is due), and a swap that is short of
+# tokens is topped up on later ticks. It starts
+#     endgame_start - SWAP_LEAD_TICKS - swaps - SWAP_MARGIN
+# so the last replacement is built SWAP_LEAD_TICKS before the endgame and has time to get
+# into position for the march.
+SWAP_EXTRACTORS = True
+SWAP_MARGIN = 6            # ticks of slack for a skipped tick (compute budget)
+SWAP_LEAD_TICKS = 150
 
-ROLE_MINER = "miner"      # extractor at the enemy deposit
-ROLE_ESCORT = "escort"    # shooter / healer guarding the miners
-ROLE_BASE = "base"        # reinforcement waiting at home (phase 1)
-ROLE_ATTACK = "attack"    # shooter / healer on the payload (phase 2)
+# How many extra ticks to allow on top of a straight walk (turning, detours, spacing).
+WALK_SLACK = 40
+
+# --- the payload push and hold --------------------------------------------------------
+# The two chokes to hold, in OUR frame (the engine mirrors the world for the other side, so
+# these are right whichever side we spawn on): (25, 15) is the doorway east of the payload's
+# corner and (22, 13) the one north of it.
+PAYLOAD_CHOKES = [(25.0, 15.0), (22.0, 13.0)]
+# The payload is pushed to the point on its path that is nearest to both chokes (found from the
+# map at start-up), then let go: pushing stops once everyone is more than the capture radius
+# away. The team starts standing off when the payload is PUSH_LEAD_ARC short of that point (it
+# takes a moment to walk out of the capture radius and the payload keeps rolling meanwhile), and
+# goes back to pushing if it is knocked back by REPUSH_ARC or more.
+PUSH_LEAD_ARC = 0.8
+REPUSH_ARC = 2.0
+HOLD_CLEAR = 2.7            # firing lines stay this far from the payload (capture radius + margin)
+# Start the march this many ticks before the swap below would begin (0 = together with it).
+PUSH_EARLY_TICKS = 0
+
+ROLE_MINER = "miner"        # extractor at our deposit
+ROLE_DEFENDER = "defender"  # shooter / healer: holds the gates, later escorts/holds the payload
 
 
 def get_strategy(team: int) -> Strategy:
@@ -197,30 +209,46 @@ class SlotBook:
         return order[0]
 
 
+class Gate:
+    """A narrow place the enemy has to come through to reach our half."""
+
+    def __init__(self, cx, cy, lane, exit_pts):
+        self.cx, self.cy = cx, cy
+        self.lane = lane          # route points on the enemy's side, before the gate
+        self.exit = exit_pts      # route points from the gate on: where the enemy steps out
+        self.width = 0.0
+        self.hits = 1
+        self.prior = 0.0
+        self.order = []           # standing spots (grid indices), best first
+        self.info = {}            # grid index -> (exit points seen, lane points seen)
+
+
 class Plan:
     def __init__(self):
         self.ready = False
-        self.role = {}      # bot id -> role
-        self.cls = {}       # bot id -> BotClass it was born as (catches id reuse)
-        self.pending = None  # (role, class) of the bot we ordered last tick
+        self.role = {}          # bot id -> role
+        self.cls = {}           # bot id -> BotClass it was born as (catches id reuse)
+        self.pending = None     # (role, class) of the bot we ordered last tick
         self.built = 0
-        self.aim = {}       # bot id -> enemy id it was last aiming at
-        self.dep_book = SlotBook()
-        self.base_book = SlotBook()
+        self.aim = {}           # bot id -> enemy id it was last aiming at
+        self.miner_book = SlotBook()
+        self.gate_of = {}       # defender id -> index of the gate it holds
+        self.spot_of = {}       # defender id -> grid index of its standing spot
+        self.taken = {}         # grid index -> defender id
+        self.pressure = []
+        self.weights = []
+        self.last_pressure = -10 ** 9
+        self.last_rebalance = -10 ** 9
         self.ring_of = {}
         self._ring_tick = -1
         self._ring_cache = {}
-        self.phase2_announced = False
+        self._width_cache = {}
+        self.mode = "home"      # "home" (holding the gates) -> "push" <-> "hold" (at the chokes)
+        self.gates = []         # the gates of the front in use (home or payload chokes)
+        self.fgrid = []         # ... and the standing spots they refer to
         self.swap_done = False
-        self.post = {}          # guard shooter id -> "front" | "rear" (its calm-state post)
         self.hist = {}          # bot id -> recent (x, y, wanted_to_move) for the stuck check
         self.escape = {}        # bot id -> (x, y, until_tick) while it steers out of a jam
-        self.quiet = 0          # consecutive ticks with no enemy near the deposit
-        self.collapsed = set()  # guard bots currently sent to the payload (may be recalled)
-        self.alert = False
-        self.alert_at = (0.0, 0.0)
-        self.alert_tick = 0
-        self.calm = 0
 
     # ---------------------------------------------------------------------------------
     # entry point
@@ -246,58 +274,84 @@ class Plan:
         self.spacing = self.hard + 0.15                                   # ~1.05: rest spacing
         self.threat_range = b.blaster_range + THREAT_MARGIN
         self.map_max = float(MAP_SIZE) - 0.4
+        self.endgame_start = conf.max_ticks - conf.endgame_ticks
+        self.y_min = Y_LINE + Y_MARGIN
 
         self.spawn = (b.radius + 0.002, float(MAP_SIZE) - b.radius - 0.002)
-
-        d = state.deposit_other.pos
-        self.dep_x, self.dep_y = d.x, d.y
-        miner_spots, front_spots, flank_spots, rear_spots = self._deposit_spots()
-        self.dep_spots = miner_spots + front_spots + flank_spots + rear_spots
-        n_m, n_f, n_s = len(miner_spots), len(front_spots), len(flank_spots)
-        miner_idx = list(range(n_m))
-        front_idx = list(range(n_m, n_m + n_f))                  # frontmost first
-        flank_idx = list(range(n_m + n_f, n_m + n_f + n_s))      # beside the extractors
-        rear_idx = list(range(n_m + n_f + n_s, len(self.dep_spots)))  # behind them
-        # The extractors sit deepest; the healer just in front of them; the shooters are split
-        # between the front (ahead of the healer and extractors) and the rear (behind them).
-        # Each class falls back on the other pools only if its own runs out.
-        self.miner_order = miner_idx + front_idx[::-1] + flank_idx + rear_idx
-        self.healer_order = front_idx[::-1] + flank_idx + rear_idx + miner_idx
-        self.front_order = front_idx + flank_idx + rear_idx + miner_idx
-        self.rear_order = rear_idx + flank_idx + front_idx[::-1] + miner_idx
-        self.guard_idx = front_idx + flank_idx + rear_idx   # every spot a guard shooter may hold
-        self.escort_only = list(self.guard_idx)             # for flanking round a deposit
-
         self.enemy_spawn = (float(MAP_SIZE) - self.spawn[0], float(MAP_SIZE) - self.spawn[1])
 
-        # How long a new extractor takes to walk from our spawn to a mining spot.
-        mine_at = self.dep_spots[0] if miner_spots else (self.dep_x, self.dep_y)
-        walk = path_length(Vec2(self.spawn[0], self.spawn[1]), Vec2(mine_at[0], mine_at[1]))
-        if walk is None:
-            walk = 1.4 * _dist(self.spawn[0], self.spawn[1], mine_at[0], mine_at[1])
-        self.dep_walk_ticks = int(walk / b.speed) + SWAP_ARRIVAL_SLACK
+        d = state.deposit_me.pos
+        self.dep_x, self.dep_y = d.x, d.y
+        gx, gy = self.dep_x, self.dep_y + conf.deposit.radius + b.radius + 0.05
+        if not self._standable(gx, gy):
+            gx, gy = self.dep_x - conf.deposit.radius - b.radius - 0.05, self.dep_y
+        self.goal = (gx, gy)
 
-        self.base_spots = self._base_spots()
-        self.base_order = list(range(len(self.base_spots)))
-        # Healers wait at the back of the base group: of the spots nearest the rally point,
-        # the ones furthest from the enemy's side of the map.
-        head = self.base_order[:16]
-        self.base_healer_order = (
-            sorted(head, key=lambda i: -_dist(self.base_spots[i][0], self.base_spots[i][1],
-                                              self.enemy_spawn[0], self.enemy_spawn[1]))
-            + self.base_order[16:]
+        # The march starts about when the extractor swap would (see SWAP_EXTRACTORS).
+        self.push_start = (
+            self.endgame_start - SWAP_LEAD_TICKS - N_MINERS - SWAP_MARGIN - PUSH_EARLY_TICKS
         )
+
+        # Front 1: the gates of our half, held until the march.
+        self.grid = self._build_grid()
+        self.home_gates = self._find_gates()
+        self._set_priors(self.home_gates)
+        self.mine_order = self._mining_spots()
+        self.mine_set = set(self.mine_order[:N_MINERS])
+        for g in self.home_gates:
+            self._score_gate(g, self.grid, self.mine_set, None)
+
+        # Front 2: the payload chokes, held from the march on.
+        self._find_hold()
+        self.push_grid, self.push_gates = self._build_push_front()
+
+        self._use_front(self.home_gates, self.grid)
+
+        # How long a new extractor takes to walk from our spawn to a mining spot.
+        mine_at = self.grid[self.mine_order[0]] if self.mine_order else (self.dep_x, self.dep_y)
+        self.dep_walk_ticks = self._walk_ticks(self.spawn, mine_at)
 
         self.ring_offsets = self._ring_offsets()
 
+        self._describe("home gate", self.home_gates, self.grid)
+        self._describe("payload choke", self.push_gates, self.push_grid)
         print(
-            f"[plan] enemy deposit at ({self.dep_x:.1f}, {self.dep_y:.1f}); "
-            f"{len(miner_spots)} mining spots, guard spots: {len(front_spots)} front / "
-            f"{len(flank_spots)} side / {len(rear_spots)} rear, {len(self.base_spots)} base spots"
+            f"[plan] our deposit at ({self.dep_x:.1f}, {self.dep_y:.1f}); "
+            f"{len(self.mine_order)} mining spots, {len(self.grid)} standing spots in our half; "
+            f"march at tick {self.push_start}, payload to be pushed to capture "
+            f"{self.hold_capture:.3f} (at {self.hold_pos[0]:.1f}, {self.hold_pos[1]:.1f})"
         )
-        if len(miner_spots) < N_MINERS:
-            print(f"[plan] WARNING: only {len(miner_spots)} spots with a sightline to the deposit")
+        if len(self.mine_order) < N_MINERS:
+            print(f"[plan] WARNING: only {len(self.mine_order)} spots with a sightline to the deposit")
         self.ready = True
+
+    def _describe(self, label, gates, grid):
+        for i, g in enumerate(gates):
+            best = g.info[g.order[0]] if g.order else (0, 0)
+            print(
+                f"[plan] {label} {i} at ({g.cx:.1f}, {g.cy:.1f}): width {g.width:.1f}, "
+                f"routes {g.hits}, prior {g.prior:.2f}, {len(g.order)} spots "
+                f"(best sees {best[0]} exit / {best[1]} lane points)"
+            )
+
+    def _use_front(self, gates, grid):
+        """Switch which set of gates (and standing spots) the defenders are held on."""
+        self.gates = gates
+        self.fgrid = grid
+        self.gate_of = {}
+        self.spot_of = {}
+        self.taken = {}
+        self.pressure = [0.0] * len(gates)
+        self.weights = [g.prior for g in gates]
+        self.last_pressure = -10 ** 9
+        self.last_rebalance = -10 ** 9
+
+    def _walk_ticks(self, frm, to):
+        """Ticks to walk from `frm` to `to`, around walls."""
+        d = path_length(Vec2(frm[0], frm[1]), Vec2(to[0], to[1]))
+        if d is None:
+            d = 1.4 * _dist(frm[0], frm[1], to[0], to[1])
+        return int(d / self.conf.bot.speed) + WALK_SLACK
 
     def _standable(self, x, y):
         if x < 0.4 or y < 0.4 or x > self.map_max or y > self.map_max:
@@ -307,62 +361,271 @@ class Plan:
     def _reachable(self, x, y):
         return path_length(Vec2(self.spawn[0], self.spawn[1]), Vec2(x, y)) is not None
 
-    def _lattice(self, cx, cy, half):
-        n = int(half / self.spacing)
-        for i in range(-n, n + 1):
-            for j in range(-n, n + 1):
-                yield cx + i * self.spacing, cy + j * self.spacing
+    def _build_grid(self):
+        """Every standing spot in our half. One lattice for everything, so two spots are never
+        closer than `spacing` however they are used."""
+        pts = []
+        y = self.y_min
+        while y <= self.map_max:
+            x = 0.5
+            while x <= self.map_max:
+                if self._standable(x, y) and self._reachable(x, y):
+                    pts.append((x, y))
+                x += self.spacing
+            y += self.spacing
+        return pts
 
-    def _deposit_spots(self):
-        conf = self.conf
-        r_min = conf.deposit.radius + conf.bot.radius + 0.35
-        dvec = Vec2(self.dep_x, self.dep_y)
-        # "Front" is towards the enemy. Depth is the walking distance from the enemy's spawn:
-        # the smaller it is, the more exposed the spot.
-        enemy_spawn = Vec2(float(MAP_SIZE) - self.spawn[0], float(MAP_SIZE) - self.spawn[1])
-        found = []
-        for x, y in self._lattice(self.dep_x, self.dep_y, 9.0):
-            d = _dist(x, y, self.dep_x, self.dep_y)
-            if d < r_min or not self._standable(x, y) or not self._reachable(x, y):
+    # ---- gates -----------------------------------------------------------------------
+
+    def _polyline(self, a, b):
+        """The route from a to b as points 0.5 apart, or None."""
+        wps = route_waypoints(a, b)
+        if wps is None:
+            return None
+        pts = [(a.x, a.y)] + [(w.x, w.y) for w in wps] + [(b.x, b.y)]
+        out = [pts[0]]
+        for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+            n = max(1, int(math.hypot(x1 - x0, y1 - y0) / 0.5))
+            for k in range(1, n + 1):
+                t = k / n
+                out.append((x0 + (x1 - x0) * t, y0 + (y1 - y0) * t))
+        return out
+
+    def _width(self, route, i):
+        """How much room there is across the route at sample i: the free run of standable
+        points to either side, at right angles to the direction of travel."""
+        px, py = route[i]
+        ax, ay = route[max(0, i - 1)]
+        bx, by = route[min(len(route) - 1, i + 1)]
+        dx, dy = bx - ax, by - ay
+        n = math.hypot(dx, dy)
+        if n < 1e-9:
+            return 99.0
+        key = (round(px * 4), round(py * 4), round(math.degrees(math.atan2(dy, dx)) / 45.0))
+        cached = self._width_cache.get(key)
+        if cached is not None:
+            return cached
+        nx, ny = -dy / n, dx / n
+        total = 0.0
+        for sgn in (1.0, -1.0):
+            reach = 0.0
+            while reach < 6.0 and point_free(
+                Vec2(px + sgn * nx * (reach + 0.25), py + sgn * ny * (reach + 0.25))
+            ):
+                reach += 0.25
+            total += reach
+        self._width_cache[key] = total
+        return total
+
+    def _gate_on_route(self, route):
+        """The gate on a route: its narrowest spot around where it enters our half."""
+        cross = None
+        for i, (_, y) in enumerate(route):
+            if y >= Y_LINE:
+                cross = i
+                break
+        if cross is None or cross == 0:
+            return None
+        lo = max(0, cross - GATE_BEFORE)
+        hi = min(len(route) - 1, cross + GATE_AFTER)
+        widths = [self._width(route, i) for i in range(lo, hi + 1)]
+        wmin = min(widths)
+        k = next(j for j, w in enumerate(widths) if w <= wmin + GATE_TIE)
+        ci = lo + k
+        gate = Gate(route[ci][0], route[ci][1], route[max(0, ci - GATE_LANE):ci],
+                    route[ci:ci + GATE_EXIT])
+        gate.width = wmin
+        return gate
+
+    def _find_gates(self):
+        goal = Vec2(self.goal[0], self.goal[1])
+        gates = []
+        for oy in range(2, int(Y_LINE) - 2, GATE_ORIGIN_STEP):
+            for ox in range(2, MAP_SIZE - 1, GATE_ORIGIN_STEP):
+                if not self._standable(float(ox), float(oy)):
+                    continue
+                route = self._polyline(Vec2(float(ox), float(oy)), goal)
+                if not route:
+                    continue
+                gate = self._gate_on_route(route)
+                if gate is None:
+                    continue
+                for g in gates:
+                    if _dist(g.cx, g.cy, gate.cx, gate.cy) <= GATE_MERGE_DIST:
+                        g.hits += 1
+                        break
+                else:
+                    gates.append(gate)
+        gates.sort(key=lambda g: -g.hits)
+        gates = gates[:MAX_GATES]
+        if not gates:
+            gates = self._seed_gates()
+        return gates
+
+    def _seed_gates(self):
+        print("[plan] WARNING: no gates found from the map, using GATE_SEEDS")
+        gates = []
+        for cx, cy in GATE_SEEDS:
+            if self._standable(cx, cy):
+                g = Gate(cx, cy, [], [(cx, cy)])
+                g.width = 0.0
+                gates.append(g)
+        if not gates:
+            gates = [Gate(16.0, 26.0, [], [(16.0, 26.0)])]
+        return gates
+
+    def _set_priors(self, gates):
+        """Before any enemy is seen, favour the gate on the enemy's shortest route to us."""
+        n_g = len(gates)
+        route = self._polyline(
+            Vec2(self.enemy_spawn[0], self.enemy_spawn[1]), Vec2(self.goal[0], self.goal[1])
+        )
+        primary = 0
+        if route and n_g:
+            gaps = [min(_dist(g.cx, g.cy, x, y) for x, y in route) for g in gates]
+            primary = gaps.index(min(gaps))
+        for i, g in enumerate(gates):
+            if n_g == 1:
+                g.prior = 1.0
+            else:
+                g.prior = PRIOR_PRIMARY if i == primary else (1.0 - PRIOR_PRIMARY) / (n_g - 1)
+
+    def _score_gate(self, g, grid, exclude, solid):
+        """Rank the standing spots around a gate.
+
+        A good spot can see where the enemy steps out (the gate and the route just past it) but
+        cannot be seen from the approach behind it, so the enemy has to come out into our fire
+        one at a time before it can shoot back. Score = exit points seen - LANE_WEIGHT * lane
+        points seen, ties going to the spot nearer the gate.
+
+        `exclude` is a set of grid indices not to use; `solid` is an optional (centre, radius)
+        that blocks shots, like the payload does at its hold point: a line through it is not a
+        line of sight.
+        """
+        rng = self.conf.bot.blaster_range
+
+        def sees(here, hx, hy, tx, ty):
+            if not line_of_sight(here, Vec2(tx, ty)):
+                return False
+            if solid is not None and point_seg_dist(solid[0], here, Vec2(tx, ty)) < solid[1]:
+                return False
+            return True
+
+        rows = []
+        for idx, (x, y) in enumerate(grid):
+            if idx in exclude:
                 continue
-            depth = path_length(enemy_spawn, Vec2(x, y))
-            if depth is None:
-                depth = _dist(x, y, enemy_spawn.x, enemy_spawn.y)
-            found.append((d, x, y, depth))
-        found.sort()   # nearest the deposit first
+            d = _dist(x, y, g.cx, g.cy)
+            if d < GATE_SPOT_MIN or d > GATE_SPOT_MAX:
+                continue
+            here = Vec2(x, y)
+            seen_exit = sum(
+                1 for ex, ey in g.exit
+                if _dist(x, y, ex, ey) <= rng - 1.0 and sees(here, x, y, ex, ey)
+            )
+            seen_lane = sum(1 for lx, ly in g.lane if sees(here, x, y, lx, ly))
+            rows.append((seen_exit - LANE_WEIGHT * seen_lane, -d, idx, seen_exit, seen_lane))
+        rows.sort(reverse=True)
+        g.order = [r[2] for r in rows]
+        g.info = {r[2]: (r[3], r[4]) for r in rows}
 
-        # Extractors: of the spots that can mine, the ones deepest behind the guard.
-        eligible = [
-            s for s in found
-            if s[0] <= MINER_MAX_DIST and line_of_sight(Vec2(s[1], s[2]), dvec)
-        ]
-        eligible.sort(key=lambda s: (-s[3], s[0]))
-        miners = eligible[:N_MINERS]
-        taken = {(s[1], s[2]) for s in miners}
-        shallowest = min((s[3] for s in miners), default=0.0)
+    # ---- the payload front -----------------------------------------------------------
 
-        # Guard spots, in three pools relative to the extractors' depth: in front of them,
-        # beside them, or behind them (each the nearest GUARD_POOL to the deposit). Frontmost
-        # first, so the front shooters fill the very front and the healer (which takes the
-        # list backwards) sits just ahead of the extractors.
-        deepest = max((s[3] for s in miners), default=0.0)
-        rest = [s for s in found if (s[1], s[2]) not in taken]   # nearest the deposit first
-        front = [s for s in rest if s[3] <= shallowest][:GUARD_POOL]
-        flank = [s for s in rest if shallowest < s[3] <= deepest][:GUARD_POOL]
-        rear = [s for s in rest if s[3] > deepest][:GUARD_POOL]
-        front.sort(key=lambda s: (s[3], s[0]))   # frontmost first
+    def _find_hold(self):
+        """Where on its path to leave the payload: the point nearest to both chokes.
 
-        xy = lambda spots: [(s[1], s[2]) for s in spots]
-        return xy(miners), xy(front), xy(flank), xy(rear)
+        Minimises the larger of the distances to the chokes, so it sits between them.
+        """
+        self.chokes = [c for c in PAYLOAD_CHOKES if self._standable(c[0], c[1])]
+        pts = [self.conf.payload_path[i] for i in range(PAYLOAD_PATH_LEN)]
+        self.path_len = sum(
+            _dist(pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y) for i in range(len(pts) - 1)
+        )
+        best = None
+        for step in range(0, 251):
+            t = step * 0.002
+            p = payload_pos(t)
+            if self.chokes:
+                worst = max(_dist(p.x, p.y, cx, cy) for cx, cy in self.chokes)
+            else:
+                worst = abs(t - 0.15)
+            if best is None or worst < best[0]:
+                best = (worst, t, p.x, p.y)
+        _, self.hold_capture, hx, hy = best
+        self.hold_pos = (hx, hy)
+        self.hold_solid = (Vec2(hx, hy), self.conf.payload.radius)
 
-    def _base_spots(self):
-        bx, by = BASE_POINT
+    def _our_side(self, x, y):
+        """Is (x, y) on our side of the chokes: can it reach our spawn without passing one?"""
+        route = self._polyline(Vec2(x, y), Vec2(self.spawn[0], self.spawn[1]))
+        if not route:
+            return False
+        return all(
+            _dist(px, py, cx, cy) > 1.5 for px, py in route for cx, cy in self.chokes
+        )
+
+    def _push_gate(self, cx, cy):
+        """A choke as a Gate: the enemy's approach to it, and the way on towards the payload."""
+        lane = []
+        route = self._polyline(
+            Vec2(self.enemy_spawn[0], self.enemy_spawn[1]), Vec2(cx, cy)
+        )
+        if route:
+            lane = route[max(0, len(route) - 1 - GATE_LANE):-1]
+        exit_pts = [(cx, cy)]
+        hx, hy = self.hold_pos
+        for ax, ay in ((hx - 4.0, hy + 1.2), (hx - 3.0, hy + 2.0), (hx - 2.0, hy + 2.5)):
+            if self._standable(ax, ay):
+                onward = self._polyline(Vec2(cx, cy), Vec2(ax, ay))
+                if onward:
+                    exit_pts = onward[:GATE_EXIT]
+                break
+        return Gate(cx, cy, lane, exit_pts)
+
+    def _build_push_front(self):
+        """The standing spots and gates for holding the payload chokes."""
+        if not self.chokes:
+            print("[plan] WARNING: no usable PAYLOAD_CHOKES; the team will just keep escorting")
+            return [], []
+        hx, hy = self.hold_pos
+        grid = []
+        y = 0.5
+        while y <= self.map_max:
+            x = 0.5
+            while x <= self.map_max:
+                near = any(
+                    GATE_SPOT_MIN <= _dist(x, y, cx, cy) <= GATE_SPOT_MAX for cx, cy in self.chokes
+                )
+                if (near and _dist(x, y, hx, hy) >= HOLD_CLEAR and self._standable(x, y)
+                        and self._our_side(x, y)):
+                    grid.append((x, y))
+                x += self.spacing
+            y += self.spacing
+
+        gates = [self._push_gate(cx, cy) for cx, cy in self.chokes]
+        for g in gates:
+            g.prior = 1.0 / len(gates)
+            self._score_gate(g, grid, set(), self.hold_solid)
+        return grid, gates
+
+    # ---- extractor spots -------------------------------------------------------------
+
+    def _mining_spots(self):
+        """Spots that can mine our deposit, safest first: the ones furthest from every gate."""
+        conf = self.conf
+        dvec = Vec2(self.dep_x, self.dep_y)
+        r_min = conf.deposit.radius + conf.bot.radius + 0.35
         found = []
-        for x, y in self._lattice(bx, by, 8.0):
-            if self._standable(x, y) and self._reachable(x, y):
-                found.append((_dist(x, y, bx, by), x, y))
+        for idx, (x, y) in enumerate(self.grid):
+            d = _dist(x, y, self.dep_x, self.dep_y)
+            if d < r_min or d > MINER_MAX_DIST:
+                continue
+            if not line_of_sight(Vec2(x, y), dvec):
+                continue
+            safety = min((_dist(x, y, g.cx, g.cy) for g in self.home_gates), default=d)
+            found.append((-safety, d, idx))
         found.sort()
-        return [(x, y) for _, x, y in found]
+        return [idx for _, _, idx in found]
 
     def _ring_offsets(self):
         """Standing offsets around the payload, in rings, at least `spacing` apart.
@@ -401,23 +664,22 @@ class Plan:
             (payload, conf.payload.radius),
         ]
         self._enemy_pts = [(e.id, e.pos.x, e.pos.y) for e in enemies]
-        # Only enemy shooters are a danger to stand near: extractors and healers cannot hurt us,
-        # and an enemy extractor mining its own deposit is not an attack on ours.
+        # Only enemy shooters are a danger to stand near: extractors and healers cannot hurt us.
         self._threat_pts = [
             (e.id, e.pos.x, e.pos.y) for e in enemies if e.class_ == BotClass.Battle
         ]
         self._clear_cache = {}
 
         self._sync_roles(me, tick)
-        if tick >= SWITCH_TICK and not self.phase2_announced:
-            self.phase2_announced = True
-            print(f"[plan] tick {tick}: phase 2 -- base bots go to the payload")
+        self._update_mode(state, tick)
+        holding = self.mode == "home"
 
         action = FleetAction.new()
         self._decide_build(state, conf, action)
+        if self.mode != "push":
+            self._plan_defense(me, tick)
 
         # 1. where does each bot want to go
-        self._update_guard(me, tick)
         targets = {}
         for bid, bot in me.items():
             targets[bid] = self._target(bid, bot, state)
@@ -450,6 +712,14 @@ class Plan:
                 final[bid] = unstick
 
         speed = conf.bot.speed
+        if holding:
+            # Nobody crosses the line until the march begins.
+            for bid, bot in me.items():
+                fx, fy = final[bid]
+                if bot.pos.y + fy * speed < self.y_min:
+                    fy = min(1.0, (self.y_min - bot.pos.y) / speed)
+                    final[bid] = (fx, fy)
+
         npos = {
             bid: (bot.pos.x + final[bid][0] * speed, bot.pos.y + final[bid][1] * speed)
             for bid, bot in me.items()
@@ -464,7 +734,7 @@ class Plan:
             nx, ny = npos[bid]
 
             if bot.class_ == BotClass.Extractor:
-                ba.turn_action = turn_towards(state.deposit_other.pos)
+                ba.turn_action = turn_towards(state.deposit_me.pos)
                 ba.special_action = SpecialAction.Extractor(mine=True)
                 if bid in swap:
                     ba.self_destruct = True
@@ -483,12 +753,25 @@ class Plan:
         self.role.pop(bid, None)
         self.cls.pop(bid, None)
         self.aim.pop(bid, None)
-        self.post.pop(bid, None)
         self.hist.pop(bid, None)
         self.escape.pop(bid, None)
-        self.dep_book.drop(bid)
-        self.base_book.drop(bid)
+        self.miner_book.drop(bid)
         self.ring_of.pop(bid, None)
+        self._release(bid)
+
+    def _release(self, bid):
+        """Give up a defender's gate and standing spot."""
+        self.gate_of.pop(bid, None)
+        idx = self.spot_of.pop(bid, None)
+        if idx is not None and self.taken.get(idx) == bid:
+            del self.taken[idx]
+
+    def _assign_spot(self, bid, idx):
+        old = self.spot_of.get(bid)
+        if old is not None and self.taken.get(old) == bid:
+            del self.taken[old]
+        self.spot_of[bid] = idx
+        self.taken[idx] = bid
 
     def _sync_roles(self, me, tick):
         for bid in list(self.role):
@@ -505,28 +788,118 @@ class Plan:
                 if bot.class_ == BotClass.Extractor:
                     role = ROLE_MINER
                 else:
-                    role = ROLE_BASE if tick < SWITCH_TICK else ROLE_ATTACK
+                    role = ROLE_DEFENDER
             self.role[bid] = role
             self.cls[bid] = bot.class_
         self.pending = None
 
-        if tick >= SWITCH_TICK:
-            for bid, role in self.role.items():
-                if role == ROLE_BASE:
-                    self.role[bid] = ROLE_ATTACK
-                    self.base_book.drop(bid)
+    def _update_mode(self, state, tick):
+        """home -> push (the march starts) <-> hold (the payload is where we want it).
+
+        Pushing stops a little before the hold point (the team needs a moment to walk out of
+        the payload's capture radius, and it keeps rolling meanwhile), and starts again if the
+        payload is knocked back.
+        """
+        if self.mode == "home":
+            if tick < self.push_start:
+                return
+            self.mode = "push"
+            self._use_front(self.push_gates, self.push_grid)
+            for bid in list(self.role):
+                self._release(bid)
+            self.ring_of = {}
+            print(f"[plan] tick {tick}: the march begins -- escorting the payload to the chokes")
+
+        if not self.push_gates:
+            return   # no chokes to hold: keep escorting
+        remaining = (self.hold_capture - state.capture) * self.path_len
+        if self.mode == "push" and remaining <= PUSH_LEAD_ARC:
+            self.mode = "hold"
+            print(f"[plan] tick {tick}: payload at the chokes (capture {state.capture:.3f}) -- holding")
+        elif self.mode == "hold" and remaining >= REPUSH_ARC:
+            self.mode = "push"
+            print(f"[plan] tick {tick}: payload knocked back (capture {state.capture:.3f}) -- pushing")
 
     # ---------------------------------------------------------------------------------
     # the fabricator
     # ---------------------------------------------------------------------------------
+
+    def _pool_class(self):
+        """Class for a bot joining the defence (and later the payload team).
+
+        Keeps the pool at BASE_SHOOTERS_PER_HEALER shooters per healer by looking at who is
+        actually alive, not at a running count, so it stays right after deaths and no matter
+        which kind of build produced the bots so far. A healer is due once there are enough
+        shooters to have earned another one.
+        """
+        shooters = healers = 0
+        for bid, role in self.role.items():
+            if role != ROLE_DEFENDER:
+                continue
+            if self.cls[bid] == BotClass.Battle:
+                shooters += 1
+            elif self.cls[bid] == BotClass.Healer:
+                healers += 1
+        if shooters >= BASE_SHOOTERS_PER_HEALER * (healers + 1):
+            return BotClass.Healer
+        return BotClass.Battle
+
+    def _want_extractor(self, state, conf):
+        """Should the next build replace a lost extractor?
+
+        Yes while there are fewer than N_MINERS, unless a replacement could not arrive and mine
+        for EXTRACTOR_MIN_MINE_TICKS before the extractors are swapped out for fighters (see
+        SWAP_EXTRACTORS) or the endgame starts: a bot built too late to earn anything is just
+        50 tokens not spent on a fighter.
+        """
+        if not REPLACE_EXTRACTORS:
+            return False
+        miners = sum(1 for role in self.role.values() if role == ROLE_MINER)
+        if miners >= N_MINERS:
+            return False
+        cutoff = self.push_start   # after this the extractors are swapped out / left behind
+        return state.tick + self.dep_walk_ticks + EXTRACTOR_MIN_MINE_TICKS <= cutoff
+
+    def _decide_build(self, state, conf, action):
+        tick = state.tick
+        fab = state.fabricator_me
+        action.fabricator_next = int(BotClass.Battle)
+        action.rush_order = False
+
+        # Nothing is built in the endgame, and a full fleet ignores builds.
+        if tick >= self.endgame_start or state.fleet_me.is_full():
+            return
+
+        natural_due = fab.next_bot_creation <= tick
+        can_rush = fab.tokens >= conf.fabricator.rush_cost
+        if not natural_due and not can_rush:
+            return
+
+        # A tick where the free build is due never also rushes, so the class we set is
+        # unambiguously the free bot's; otherwise the free build would just slide a tick.
+        if self.built < len(OPENING):
+            cls = OPENING[self.built]
+            role = ROLE_MINER if cls == BotClass.Extractor else ROLE_DEFENDER
+            self.built += 1
+        elif self._want_extractor(state, conf):
+            # Income comes first: with no extractors nothing is ever earned to build with, so a
+            # lost extractor takes the next build, free or paid.
+            cls = BotClass.Extractor
+            role = ROLE_MINER
+        else:
+            cls = self._pool_class()
+            role = ROLE_DEFENDER
+
+        action.fabricator_next = int(cls)
+        action.rush_order = not natural_due
+        self.pending = (role, cls)
 
     def _plan_swap(self, state, conf, me):
         """Ids of extractors to self-destruct this tick so their slots can be refilled."""
         if not SWAP_EXTRACTORS:
             return set()
         tick = state.tick
-        endgame_start = conf.max_ticks - conf.endgame_ticks
-        last_build = endgame_start - 1   # last tick a rush is honoured
+        last_build = self.endgame_start - 1   # last tick a rush is honoured
         if tick >= last_build:
             return set()
         miners = [bid for bid, role in self.role.items() if role == ROLE_MINER]
@@ -545,8 +918,7 @@ class Plan:
         k = min(len(miners), builds - free_slots, last_build - tick)
         if k <= 0:
             return set()
-        # Not yet: the replacements would still be walking when the endgame starts.
-        if tick < endgame_start - self._walk_ticks(state, conf) - k - SWAP_MARGIN:
+        if tick < last_build - SWAP_LEAD_TICKS - k - SWAP_MARGIN:
             return set()
 
         miners.sort(key=lambda bid: (me[bid].health, bid))
@@ -558,103 +930,195 @@ class Plan:
         )
         return chosen
 
-    def _walk_ticks(self, state, conf):
-        """Ticks a bot built at our spawn needs to reach the payload."""
-        p = state.payload_pos()
-        d = path_length(Vec2(self.spawn[0], self.spawn[1]), Vec2(p.x, p.y))
-        if d is None:
-            d = 1.4 * _dist(self.spawn[0], self.spawn[1], p.x, p.y)
-        return int(d / conf.bot.speed) + SWAP_ARRIVAL_SLACK
+    # ---------------------------------------------------------------------------------
+    # holding the gates
+    # ---------------------------------------------------------------------------------
 
-    def _pool_class(self):
-        """Class for a bot headed for the attack pool (base bots now, payload bots later).
+    def _apportion(self, n, weights):
+        """Split n men between the gates in proportion to their weights."""
+        total = sum(weights)
+        if n <= 0 or total <= 0.0:
+            return [0] * len(weights)
+        shares = [n * w / total for w in weights]
+        counts = [int(s) for s in shares]
+        left = n - sum(counts)
+        for i in sorted(range(len(weights)), key=lambda i: shares[i] - counts[i], reverse=True)[:left]:
+            counts[i] += 1
+        return counts
 
-        Keeps the pool at BASE_SHOOTERS_PER_HEALER shooters per healer by looking at who is
-        actually alive, not at a running count, so it stays right after deaths and no matter
-        which kind of build (free, rush or post-swap refill) produced the bots so far. A healer
-        is due once there are enough shooters to have earned another one.
-        """
-        shooters = healers = 0
-        for bid, role in self.role.items():
-            if role != ROLE_BASE and role != ROLE_ATTACK:
-                continue
-            if self.cls[bid] == BotClass.Battle:
-                shooters += 1
-            elif self.cls[bid] == BotClass.Healer:
-                healers += 1
-        if shooters >= BASE_SHOOTERS_PER_HEALER * (healers + 1):
-            return BotClass.Healer
-        return BotClass.Battle
+    def _update_pressure(self):
+        """Weigh each gate by the enemy shooters that would reach it first."""
+        n_g = len(self.gates)
+        raw = [0.0] * n_g
+        for _, ex, ey in self._threat_pts:
+            best = None
+            for gi, g in enumerate(self.gates):
+                d = path_length(Vec2(ex, ey), Vec2(g.cx, g.cy))
+                if d is None:
+                    d = 1.4 * _dist(ex, ey, g.cx, g.cy)
+                if best is None or d < best[0]:
+                    best = (d, gi)
+            if best is not None and best[0] <= PRESSURE_RANGE:
+                raw[best[1]] += 1.0 + (PRESSURE_RANGE - best[0]) / PRESSURE_RANGE
+        for gi in range(n_g):
+            self.pressure[gi] = 0.8 * self.pressure[gi] + 0.2 * raw[gi]
+            self.weights[gi] = PRIOR_WEIGHT * self.gates[gi].prior + self.pressure[gi]
 
-    def _want_extractor(self, state, conf):
-        """Should the next build replace a lost extractor?
+    def _take_spot(self, bid, gi):
+        """Give a defender the best free standing spot at gate gi (or, failing that, anywhere)."""
+        for idx in self.gates[gi].order:
+            if idx not in self.taken:
+                self._assign_spot(bid, idx)
+                return idx
+        for other in sorted(range(len(self.gates)), key=lambda i: -self.weights[i]):
+            for idx in self.gates[other].order:
+                if idx not in self.taken:
+                    self._assign_spot(bid, idx)
+                    return idx
+        if self.gates[gi].order:
+            self._assign_spot(bid, self.gates[gi].order[0])   # out of spots: double up
+            return self.gates[gi].order[0]
+        return None
 
-        Yes while there are fewer than N_MINERS, unless: an enemy shooter is at the deposit
-        (a new extractor would only walk into the fight), or it could not arrive and mine for
-        EXTRACTOR_MIN_MINE_TICKS before the extractors are swapped out for fighters (see
-        SWAP_EXTRACTORS) or the endgame starts. A bot built too late to earn anything is just
-        50 tokens not spent on a fighter.
-        """
-        if not REPLACE_EXTRACTORS:
-            return False
-        miners = sum(1 for role in self.role.values() if role == ROLE_MINER)
-        if miners >= N_MINERS or self.quiet == 0:
-            return False
-        cutoff = conf.max_ticks - conf.endgame_ticks
-        if SWAP_EXTRACTORS:
-            cutoff -= self._walk_ticks(state, conf) + N_MINERS + SWAP_MARGIN
-        return state.tick + self.dep_walk_ticks + EXTRACTOR_MIN_MINE_TICKS <= cutoff
+    def _take_support_spot(self, bid, gi):
+        """A healer's spot at gate gi: behind the shooters, hidden from the approach, and
+        within heal range of them."""
+        g = self.gates[gi]
+        mates = [
+            self.fgrid[self.spot_of[b]] for b, gj in self.gate_of.items()
+            if gj == gi and b != bid and self.cls.get(b) == BotClass.Battle and b in self.spot_of
+        ]
+        if not mates:
+            return self._take_spot(bid, gi)
+        mx = sum(p[0] for p in mates) / len(mates)
+        my = sum(p[1] for p in mates) / len(mates)
+        mean_d = sum(_dist(p[0], p[1], g.cx, g.cy) for p in mates) / len(mates)
+        reach = self.conf.bot.base_heal_range - 0.4
+        for level in (0, 1, 2):
+            best = None
+            for idx in g.order:
+                if idx in self.taken:
+                    continue
+                x, y = self.fgrid[idx]
+                if level == 0 and g.info[idx][1] > 0:
+                    continue                                   # seen from the approach
+                if level <= 1 and _dist(x, y, g.cx, g.cy) < mean_d:
+                    continue                                   # not behind the shooters
+                d = _dist(x, y, mx, my)
+                if level <= 1 and d > reach:
+                    continue
+                if best is None or d < best[0]:
+                    best = (d, idx)
+            if best is not None:
+                self._assign_spot(bid, best[1])
+                return best[1]
+        return self._take_spot(bid, gi)
 
-    def _escort_shooters(self):
-        """How many shooters are currently guarding the extractors."""
-        return sum(
-            1 for bid, role in self.role.items()
-            if role == ROLE_ESCORT and self.cls[bid] == BotClass.Battle
-        )
-
-    def _decide_build(self, state, conf, action):
-        tick = state.tick
-        fab = state.fabricator_me
-        action.fabricator_next = int(BotClass.Battle)
-        action.rush_order = False
-
-        # Nothing is built in the endgame, and a full fleet ignores builds.
-        if tick >= conf.max_ticks - conf.endgame_ticks or state.fleet_me.is_full():
+    def _plan_defense(self, me, tick):
+        """Decide which gate each defender holds and where it stands."""
+        n_g = len(self.gates)
+        defs = sorted(bid for bid, role in self.role.items() if role == ROLE_DEFENDER and bid in me)
+        for bid in list(self.gate_of):
+            if bid not in defs:
+                self._release(bid)
+        if not defs or n_g == 0:
             return
 
-        natural_due = fab.next_bot_creation <= tick
-        can_rush = fab.tokens >= conf.fabricator.rush_cost
-        if not natural_due and not can_rush:
-            return
+        if tick - self.last_pressure >= PRESSURE_TICKS:
+            self._update_pressure()
+            self.last_pressure = tick
 
-        # A tick where the free build is due never also rushes, so the class we set is
-        # unambiguously the free bot's; otherwise the free build would just slide a tick.
-        if self.built < len(OPENING):
-            cls = OPENING[self.built]
-            role = ROLE_MINER if cls == BotClass.Extractor else ROLE_ESCORT
-            self.built += 1
-        elif self._want_extractor(state, conf):
-            # Income comes first: with no extractors nothing is ever earned to build with, so a
-            # lost extractor takes the next build, free or paid.
-            cls = BotClass.Extractor
-            role = ROLE_MINER
-        elif natural_due:
-            if tick < SWITCH_TICK and self._escort_shooters() < ESCORT_SHOOTER_CAP:
-                cls = BotClass.Battle       # refills the extraction guard
-                role = ROLE_ESCORT
+        shooters = [b for b in defs if self.cls[b] == BotClass.Battle]
+        healers = [b for b in defs if self.cls[b] == BotClass.Healer]
+        want = self._apportion(len(shooters), self.weights)
+
+        cur = [[] for _ in range(n_g)]
+        pool = []
+        for b in shooters:
+            gi = self.gate_of.get(b)
+            if gi is None:
+                pool.append(b)
             else:
-                cls = self._pool_class()
-                role = ROLE_ATTACK if tick >= SWITCH_TICK else ROLE_BASE
-        elif tick < SWITCH_TICK and REPLACE_WITH_RUSH and self._escort_shooters() < ESCORT_SHOOTER_CAP:
-            cls = BotClass.Battle
-            role = ROLE_ESCORT
-        else:
-            cls = self._pool_class()
-            role = ROLE_ATTACK if tick >= SWITCH_TICK else ROLE_BASE
+                cur[gi].append(b)
+        deficit = [want[i] - len(cur[i]) for i in range(n_g)]
 
-        action.fabricator_next = int(cls)
-        action.rush_order = not natural_due
-        self.pending = (role, cls)
+        # Move men between gates only for a real imbalance, and not too often, so the enemy
+        # feinting between two gates does not have us running back and forth.
+        moved = False
+        if tick - self.last_rebalance >= REBALANCE_TICKS and max(deficit) >= REBALANCE_SLACK:
+            for gi in sorted(range(n_g), key=lambda i: deficit[i]):
+                if deficit[gi] >= 0:
+                    break
+                target = max(range(n_g), key=lambda i: deficit[i])
+                if deficit[target] <= 0:
+                    break
+                k = min(-deficit[gi], deficit[target])
+                tg = self.gates[target]
+                nearest = sorted(
+                    cur[gi], key=lambda b: _dist(me[b].pos.x, me[b].pos.y, tg.cx, tg.cy)
+                )
+                for b in nearest[:k]:
+                    cur[gi].remove(b)
+                    pool.append(b)
+                    self._release(b)
+                    deficit[gi] += 1
+                    deficit[target] -= 1
+                    moved = True
+            if moved:
+                self.last_rebalance = tick
+                print(
+                    f"[plan] tick {tick}: rebalancing the gates to "
+                    f"{want} (weights {[round(w, 2) for w in self.weights]})"
+                )
+
+        # Place everyone without a gate: where the shortfall is biggest first, nearest breaking
+        # ties, or failing any shortfall at the heaviest gate.
+        deficit = [want[i] - len(cur[i]) for i in range(n_g)]
+        for b in sorted(pool):
+            bx, by = me[b].pos.x, me[b].pos.y
+            open_gates = [i for i in range(n_g) if deficit[i] > 0]
+            if open_gates:
+                gi = min(open_gates, key=lambda i: (
+                    -deficit[i], _dist(bx, by, self.gates[i].cx, self.gates[i].cy)))
+            else:
+                gi = max(range(n_g), key=lambda i: self.weights[i])
+            cur[gi].append(b)
+            self.gate_of[b] = gi
+            deficit[gi] -= 1
+
+        for b in shooters:
+            if b not in self.spot_of:
+                self._take_spot(b, self.gate_of[b])
+
+        # Healers go where the shooters are, behind them.
+        for h in healers:
+            gi = self.gate_of.get(h)
+            if gi is None or moved or not cur[gi] or h not in self.spot_of:
+                gi = max(range(n_g), key=lambda i: (len(cur[i]), self.weights[i]))
+                self._release(h)
+                self.gate_of[h] = gi
+                self._take_support_spot(h, gi)
+
+    def _hold_flank(self, bid, bot, idx):
+        """A defender settled on its spot that cannot hit anything it can see (a deposit or the
+        payload is in the way) shifts to another spot at its gate that can."""
+        x, y = self.fgrid[idx]
+        if _dist(bot.pos.x, bot.pos.y, x, y) > 0.35:
+            return idx
+        seen = self._flank_wanted(bot)
+        if not seen:
+            return idx
+        gi = self.gate_of.get(bid)
+        if gi is None:
+            return idx
+        cands = [
+            (i, self.fgrid[i][0], self.fgrid[i][1], 0) for i in self.gates[gi].order[:FLANK_POOL]
+        ]
+        new = self._pick_flank(bot, cands, set(self.taken), seen)
+        if new is None:
+            return idx
+        self._assign_spot(bid, new)
+        return new
 
     # ---------------------------------------------------------------------------------
     # where each role stands
@@ -662,24 +1126,18 @@ class Plan:
 
     def _target(self, bid, bot, state):
         role = self.role[bid]
-        if role == ROLE_MINER or role == ROLE_ESCORT:
-            if role == ROLE_MINER:
-                order = self.miner_order
-            elif bot.class_ == BotClass.Healer:
-                order = self.healer_order
-            else:
-                order = self.front_order if self._post_of(bid) == "front" else self.rear_order
-            idx = self.dep_book.assign(bid, order)
-            if idx is None:
-                return None
-            if role == ROLE_ESCORT and bot.class_ == BotClass.Battle:
-                idx = self._escort_flank(bid, bot, idx)
-            return self.dep_spots[idx]
-        if role == ROLE_BASE:
-            order = self.base_healer_order if bot.class_ == BotClass.Healer else self.base_order
-            idx = self.base_book.assign(bid, order)
-            return self.base_spots[idx] if idx is not None else BASE_POINT
-        return self._payload_target(bid, bot, state)
+        if role == ROLE_MINER:
+            idx = self.miner_book.assign(bid, self.mine_order)
+            return self.grid[idx] if idx is not None else None
+        # Defenders: pushing the payload, or standing at their gate.
+        if self.mode == "push":
+            return self._payload_target(bid, bot, state)
+        idx = self.spot_of.get(bid)
+        if idx is None:
+            return None
+        if bot.class_ == BotClass.Battle:
+            idx = self._hold_flank(bid, bot, idx)
+        return self.fgrid[idx]
 
     def _valid_ring(self, state):
         if self._ring_tick == state.tick:
@@ -768,7 +1226,7 @@ class Plan:
         it can already hit.
         """
         # Only enemies genuinely within reach count: one that is merely a bit too far away
-        # is not an obstacle problem, and chasing it is not what a guard or a holder does.
+        # is not an obstacle problem, and chasing it is not what a defender does.
         rng = self.conf.bot.blaster_range - 0.3
         here = Vec2(bot.pos.x, bot.pos.y)
         seen = []
@@ -798,149 +1256,8 @@ class Plan:
                 best = (key, idx)
         return best[1] if best is not None else None
 
-    def _escort_flank(self, bid, bot, idx):
-        """Same idea for a guard: shift to another guard spot if a deposit blocks its shot."""
-        x, y = self.dep_spots[idx]
-        if _dist(bot.pos.x, bot.pos.y, x, y) > 0.35:
-            return idx
-        seen = self._flank_wanted(bot)
-        if not seen:
-            return idx
-        used = set(self.dep_book.of.values())
-        cands = [
-            (i, self.dep_spots[i][0], self.dep_spots[i][1], 0)
-            for i in self.escort_only
-            if _dist(self.dep_spots[i][0], self.dep_spots[i][1], self.dep_x, self.dep_y) <= 6.0
-        ]
-        new = self._pick_flank(bot, cands, used, seen)
-        if new is None:
-            return idx
-        self.dep_book.of[bid] = new
-        return new
-
-    # ---------------------------------------------------------------------------------
-    # the extraction guard: calm posts, and running to where the enemy is
-    # ---------------------------------------------------------------------------------
-
-    def _post_of(self, bid):
-        """A guard shooter's calm-state post, keeping the front/rear split even."""
-        if bid not in self.post:
-            n_front = int(math.ceil(GUARD_FRONT_SHARE * ESCORT_SHOOTER_CAP))
-            fronts = sum(1 for p in self.post.values() if p == "front")
-            self.post[bid] = "front" if fronts < n_front else "rear"
-        return self.post[bid]
-
-    def _update_guard(self, me, tick):
-        """Alert the guard when an enemy comes near the deposit, stand it down afterwards."""
-        reach = self.conf.bot.blaster_range + GUARD_ALERT_MARGIN
-        near = None
-        for _, ex, ey in self._threat_pts:
-            d = math.hypot(ex - self.dep_x, ey - self.dep_y)
-            if d <= reach and (near is None or d < near[0]):
-                near = (d, ex, ey)
-        self.quiet = self.quiet + 1 if near is None else 0
-
-        self._collapse_check(me, tick, near is not None)
-
-        guards = sorted(
-            bid for bid, role in self.role.items()
-            if role == ROLE_ESCORT and me[bid].class_ == BotClass.Battle
-        )
-
-        if near is None or not guards:
-            if self.alert:
-                self.calm += 1
-                if self.calm >= GUARD_CALM_TICKS or not guards:
-                    self._stand_down(guards)
-            return
-
-        self.calm = 0
-        _, ex, ey = near
-        moved = _dist(ex, ey, self.alert_at[0], self.alert_at[1]) > GUARD_REPLAN_DIST
-        if not self.alert or moved or tick - self.alert_tick >= GUARD_REPLAN_TICKS:
-            self._plan_defense(guards, me, ex, ey)
-            self.alert = True
-            self.alert_at = (ex, ey)
-            self.alert_tick = tick
-
-    def _collapse_check(self, me, tick, attacked):
-        """Send the guard to the payload if the enemy leaves the extraction site alone.
-
-        Only the guard's shooters and healer go; the extractors stay and keep mining. It
-        happens once the deposit has had no enemy near it for COLLAPSE_QUIET_TICKS, from
-        COLLAPSE_AFTER_TICK onwards. If an enemy does turn up at the deposit while the
-        collapsed bots are still within RECALL_RANGE of it, they go back to guarding;
-        further away than that the trip back would take too long to matter, so they carry on.
-        """
-        if not COLLAPSE_ENABLED:
-            return
-
-        if attacked:
-            for bid in list(self.collapsed):
-                bot = me.get(bid)
-                if bot is None or self.role.get(bid) != ROLE_ATTACK:
-                    self.collapsed.discard(bid)
-                    continue
-                if _dist(bot.pos.x, bot.pos.y, self.dep_x, self.dep_y) <= RECALL_RANGE:
-                    self.role[bid] = ROLE_ESCORT
-                    self.ring_of.pop(bid, None)
-                    self.collapsed.discard(bid)
-                    print(f"[plan] tick {tick}: enemy at the deposit, bot {bid} returns to guard")
-                else:
-                    self.collapsed.discard(bid)   # too far to matter: it stays on the payload
-            return
-
-        if tick < COLLAPSE_AFTER_TICK or self.quiet < COLLAPSE_QUIET_TICKS:
-            return
-        moved = 0
-        for bid, role in list(self.role.items()):
-            if role != ROLE_ESCORT:
-                continue
-            self.role[bid] = ROLE_ATTACK
-            self.dep_book.drop(bid)
-            self.post.pop(bid, None)
-            self.collapsed.add(bid)
-            moved += 1
-        if moved:
-            self.alert = False
-            self.calm = 0
-            print(
-                f"[plan] tick {tick}: deposit quiet for {self.quiet} ticks -- "
-                f"{moved} guard bots collapse on the payload"
-            )
-
-    def _plan_defense(self, guards, me, ex, ey):
-        """Send the guard shooters to the spots nearest the enemy, quickest arrival first.
-
-        Spots are taken in order of how near they are to the enemy, and each goes to whichever
-        shooter is closest to it, so the shooters that were at the back run round to help
-        rather than everyone shuffling one place along.
-        """
-        for bid in guards:
-            self.dep_book.of.pop(bid, None)
-        held = set(self.dep_book.of.values())    # the healer's and extractors' spots stay theirs
-        spots = [i for i in self.guard_idx if i not in held]
-        spots.sort(key=lambda i: _dist(self.dep_spots[i][0], self.dep_spots[i][1], ex, ey))
-
-        remaining = set(guards)
-        for i in spots:
-            if not remaining:
-                break
-            sx, sy = self.dep_spots[i]
-            bid = min(remaining, key=lambda b: _dist(me[b].pos.x, me[b].pos.y, sx, sy))
-            remaining.discard(bid)
-            self.dep_book.of[bid] = i
-        # Anyone left over gets a free spot the normal way, in `_target`.
-
-    def _stand_down(self, guards):
-        """Threat gone: everyone goes back to the calm formation."""
-        for bid in guards:
-            self.dep_book.of.pop(bid, None)
-        self.alert = False
-        self.calm = 0
-
     def _exposure(self, x, y):
-        """How near the front a spot is: distance to the nearest enemy (smaller = more
+        """How near the front a spot is: distance to the nearest enemy shooter (smaller = more
         exposed), or to the enemy's spawn when none is on the field."""
         best = None
         for _, ex, ey in self._threat_pts:
@@ -954,10 +1271,10 @@ class Plan:
     def _cover_target(self, bot, target, me):
         """Keep a healer or extractor behind our shooters.
 
-        Returns `target` unchanged unless an enemy is close and that target would put the bot
-        closer to it than our frontmost nearby shooter, in which case it returns a spot just
-        behind that shooter. It is a pure function of where everyone stands, so a bot that has
-        tucked in stays tucked in instead of oscillating back to its old spot.
+        Returns `target` unchanged unless an enemy shooter is close and that target would put
+        the bot closer to it than our frontmost nearby shooter, in which case it returns a spot
+        just behind that shooter. It is a pure function of where everyone stands, so a bot that
+        has tucked in stays tucked in instead of oscillating back to its old spot.
         """
         px, py = bot.pos.x, bot.pos.y
         reach = self.conf.bot.blaster_range + COVER_TRIGGER
@@ -1192,12 +1509,16 @@ class Plan:
             cands.append((score, e.id, d, ang, vulnerable, blocked))
 
         if not cands:
-            # Nobody to shoot: pre-aim at the nearest enemy, else at the payload.
+            # Nobody to shoot: pre-aim at the nearest enemy shooter (else any enemy, else the
+            # payload).
             self.aim.pop(bid, None)
             ang = None
-            if enemies:
-                near = min(enemies, key=lambda e: _dist(nx, ny, e.pos.x, e.pos.y))
-                ang = _angle_deg(nx, ny, near.pos.x, near.pos.y)
+            pool = [(ex, ey) for _, ex, ey in self._threat_pts] or [
+                (ex, ey) for _, ex, ey in self._enemy_pts
+            ]
+            if pool:
+                fx, fy = min(pool, key=lambda p: _dist(nx, ny, p[0], p[1]))
+                ang = _angle_deg(nx, ny, fx, fy)
             elif _dist(nx, ny, payload.x, payload.y) > 0.5:
                 ang = _angle_deg(nx, ny, payload.x, payload.y)
             if ang is not None:
