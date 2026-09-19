@@ -61,7 +61,14 @@ SWAP_EXTRACTORS = True
 SWAP_MARGIN = 6            # ticks of slack for a skipped tick (compute budget)
 SWAP_ARRIVAL_SLACK = 40    # extra walking time allowed for turning, detours and spacing
 
-# Base reinforcements: this many shooters per healer.
+# Lost extractors are replaced (up to N_MINERS) so the income keeps flowing, ahead of every other
+# build, until a replacement could no longer arrive and mine for EXTRACTOR_MIN_MINE_TICKS before
+# the swap below (or the endgame). It also waits while an enemy shooter is at the deposit.
+REPLACE_EXTRACTORS = True
+EXTRACTOR_MIN_MINE_TICKS = 300
+
+# The attack pool (base bots, then payload bots) is kept at this many shooters per healer, for
+# every build that joins it: free builds, rush orders and the post-swap refills alike.
 BASE_SHOOTERS_PER_HEALER = 3
 
 # Where the reinforcements wait (our half, between our spawn corner and our goal).
@@ -97,7 +104,25 @@ GUARD_FRONT_SHARE = 0.5
 # closest to it, so the ones that were at the back run round to help. The plan is redone if the
 # nearest enemy has moved GUARD_REPLAN_DIST, or every GUARD_REPLAN_TICKS. After GUARD_CALM_TICKS
 # without an enemy the shooters go back to their calm posts.
-GUARD_ALERT_MARGIN = 8.0
+# Collapse: if no enemy comes near the deposit for COLLAPSE_QUIET_TICKS in a row (and the game
+# is past COLLAPSE_AFTER_TICK), the guard's shooters and healer walk to the payload and join the
+# attack; the extractors stay and keep mining. If an enemy turns up at the deposit while they
+# are still within RECALL_RANGE of it, they go back to guarding. Keep COLLAPSE_AFTER_TICK at or
+# after SWITCH_TICK: before it, free builds refill the guard, which would fight the collapse.
+COLLAPSE_ENABLED = True
+COLLAPSE_AFTER_TICK = SWITCH_TICK
+COLLAPSE_QUIET_TICKS = 300
+RECALL_RANGE = 14.0
+
+GUARD_ALERT_MARGIN = 4.0
+
+# --- stuck detection -----------------------------------------------------------------------
+# Expected travel is 0.05 a tick, i.e. 2.0 over STUCK_WINDOW ticks; under STUCK_MIN_MOVE means
+# wedged. A stuck bot ignores spacing and steers out for at most STUCK_ESCAPE_TICKS.
+STUCK_WINDOW = 40
+STUCK_MIN_MOVE = 0.5
+STUCK_ESCAPE_TICKS = 60
+STUCK_CLEAR_DIST = 2.0
 GUARD_REPLAN_DIST = 4.0
 GUARD_REPLAN_TICKS = 90
 GUARD_CALM_TICKS = 90
@@ -179,7 +204,6 @@ class Plan:
         self.cls = {}       # bot id -> BotClass it was born as (catches id reuse)
         self.pending = None  # (role, class) of the bot we ordered last tick
         self.built = 0
-        self.base_built = 0
         self.aim = {}       # bot id -> enemy id it was last aiming at
         self.dep_book = SlotBook()
         self.base_book = SlotBook()
@@ -188,8 +212,11 @@ class Plan:
         self._ring_cache = {}
         self.phase2_announced = False
         self.swap_done = False
-        self.swap_built = 0
         self.post = {}          # guard shooter id -> "front" | "rear" (its calm-state post)
+        self.hist = {}          # bot id -> recent (x, y, wanted_to_move) for the stuck check
+        self.escape = {}        # bot id -> (x, y, until_tick) while it steers out of a jam
+        self.quiet = 0          # consecutive ticks with no enemy near the deposit
+        self.collapsed = set()  # guard bots currently sent to the payload (may be recalled)
         self.alert = False
         self.alert_at = (0.0, 0.0)
         self.alert_tick = 0
@@ -242,6 +269,13 @@ class Plan:
         self.escort_only = list(self.guard_idx)             # for flanking round a deposit
 
         self.enemy_spawn = (float(MAP_SIZE) - self.spawn[0], float(MAP_SIZE) - self.spawn[1])
+
+        # How long a new extractor takes to walk from our spawn to a mining spot.
+        mine_at = self.dep_spots[0] if miner_spots else (self.dep_x, self.dep_y)
+        walk = path_length(Vec2(self.spawn[0], self.spawn[1]), Vec2(mine_at[0], mine_at[1]))
+        if walk is None:
+            walk = 1.4 * _dist(self.spawn[0], self.spawn[1], mine_at[0], mine_at[1])
+        self.dep_walk_ticks = int(walk / b.speed) + SWAP_ARRIVAL_SLACK
 
         self.base_spots = self._base_spots()
         self.base_order = list(range(len(self.base_spots)))
@@ -367,6 +401,11 @@ class Plan:
             (payload, conf.payload.radius),
         ]
         self._enemy_pts = [(e.id, e.pos.x, e.pos.y) for e in enemies]
+        # Only enemy shooters are a danger to stand near: extractors and healers cannot hurt us,
+        # and an enemy extractor mining its own deposit is not an attack on ours.
+        self._threat_pts = [
+            (e.id, e.pos.x, e.pos.y) for e in enemies if e.class_ == BotClass.Battle
+        ]
         self._clear_cache = {}
 
         self._sync_roles(me, tick)
@@ -401,8 +440,14 @@ class Plan:
                     dx, dy = _clip(v.x, v.y, 1.0)
             des[bid] = (dx, dy)
 
-        # 2. keep out of each other's splash
-        final = self._spread(me, enemies, des, conf)
+        # 2. keep out of each other's splash...
+        final = self._spread(me, des, conf)
+        # ...unless a bot has stopped making progress, in which case getting it moving again
+        # comes first: it steps off along whichever way shortens its route.
+        for bid, bot in me.items():
+            unstick = self._stuck_check(bid, bot, targets[bid], des[bid], tick)
+            if unstick is not None:
+                final[bid] = unstick
 
         speed = conf.bot.speed
         npos = {
@@ -439,6 +484,8 @@ class Plan:
         self.cls.pop(bid, None)
         self.aim.pop(bid, None)
         self.post.pop(bid, None)
+        self.hist.pop(bid, None)
+        self.escape.pop(bid, None)
         self.dep_book.drop(bid)
         self.base_book.drop(bid)
         self.ring_of.pop(bid, None)
@@ -519,14 +566,44 @@ class Plan:
             d = 1.4 * _dist(self.spawn[0], self.spawn[1], p.x, p.y)
         return int(d / conf.bot.speed) + SWAP_ARRIVAL_SLACK
 
-    def _late_class(self):
-        """Class for a phase-2 build: shooters only, except the post-swap refills, which
-        follow the same shooter:healer ratio as the base bots."""
-        if not self.swap_done:
-            return BotClass.Battle
-        is_healer = self.swap_built % (BASE_SHOOTERS_PER_HEALER + 1) == BASE_SHOOTERS_PER_HEALER
-        self.swap_built += 1
-        return BotClass.Healer if is_healer else BotClass.Battle
+    def _pool_class(self):
+        """Class for a bot headed for the attack pool (base bots now, payload bots later).
+
+        Keeps the pool at BASE_SHOOTERS_PER_HEALER shooters per healer by looking at who is
+        actually alive, not at a running count, so it stays right after deaths and no matter
+        which kind of build (free, rush or post-swap refill) produced the bots so far. A healer
+        is due once there are enough shooters to have earned another one.
+        """
+        shooters = healers = 0
+        for bid, role in self.role.items():
+            if role != ROLE_BASE and role != ROLE_ATTACK:
+                continue
+            if self.cls[bid] == BotClass.Battle:
+                shooters += 1
+            elif self.cls[bid] == BotClass.Healer:
+                healers += 1
+        if shooters >= BASE_SHOOTERS_PER_HEALER * (healers + 1):
+            return BotClass.Healer
+        return BotClass.Battle
+
+    def _want_extractor(self, state, conf):
+        """Should the next build replace a lost extractor?
+
+        Yes while there are fewer than N_MINERS, unless: an enemy shooter is at the deposit
+        (a new extractor would only walk into the fight), or it could not arrive and mine for
+        EXTRACTOR_MIN_MINE_TICKS before the extractors are swapped out for fighters (see
+        SWAP_EXTRACTORS) or the endgame starts. A bot built too late to earn anything is just
+        50 tokens not spent on a fighter.
+        """
+        if not REPLACE_EXTRACTORS:
+            return False
+        miners = sum(1 for role in self.role.values() if role == ROLE_MINER)
+        if miners >= N_MINERS or self.quiet == 0:
+            return False
+        cutoff = conf.max_ticks - conf.endgame_ticks
+        if SWAP_EXTRACTORS:
+            cutoff -= self._walk_ticks(state, conf) + N_MINERS + SWAP_MARGIN
+        return state.tick + self.dep_walk_ticks + EXTRACTOR_MIN_MINE_TICKS <= cutoff
 
     def _escort_shooters(self):
         """How many shooters are currently guarding the extractors."""
@@ -556,26 +633,24 @@ class Plan:
             cls = OPENING[self.built]
             role = ROLE_MINER if cls == BotClass.Extractor else ROLE_ESCORT
             self.built += 1
+        elif self._want_extractor(state, conf):
+            # Income comes first: with no extractors nothing is ever earned to build with, so a
+            # lost extractor takes the next build, free or paid.
+            cls = BotClass.Extractor
+            role = ROLE_MINER
         elif natural_due:
-            cls = BotClass.Battle
-            if tick >= SWITCH_TICK:
-                role = ROLE_ATTACK
-                cls = self._late_class()
-            elif self._escort_shooters() < ESCORT_SHOOTER_CAP:
+            if tick < SWITCH_TICK and self._escort_shooters() < ESCORT_SHOOTER_CAP:
+                cls = BotClass.Battle       # refills the extraction guard
                 role = ROLE_ESCORT
             else:
-                role = ROLE_BASE
+                cls = self._pool_class()
+                role = ROLE_ATTACK if tick >= SWITCH_TICK else ROLE_BASE
         elif tick < SWITCH_TICK and REPLACE_WITH_RUSH and self._escort_shooters() < ESCORT_SHOOTER_CAP:
             cls = BotClass.Battle
             role = ROLE_ESCORT
-        elif tick < SWITCH_TICK:
-            is_healer = self.base_built % (BASE_SHOOTERS_PER_HEALER + 1) == BASE_SHOOTERS_PER_HEALER
-            cls = BotClass.Healer if is_healer else BotClass.Battle
-            role = ROLE_BASE
-            self.base_built += 1
         else:
-            cls = self._late_class()
-            role = ROLE_ATTACK
+            cls = self._pool_class()
+            role = ROLE_ATTACK if tick >= SWITCH_TICK else ROLE_BASE
 
         action.fabricator_next = int(cls)
         action.rush_order = not natural_due
@@ -757,16 +832,20 @@ class Plan:
 
     def _update_guard(self, me, tick):
         """Alert the guard when an enemy comes near the deposit, stand it down afterwards."""
+        reach = self.conf.bot.blaster_range + GUARD_ALERT_MARGIN
+        near = None
+        for _, ex, ey in self._threat_pts:
+            d = math.hypot(ex - self.dep_x, ey - self.dep_y)
+            if d <= reach and (near is None or d < near[0]):
+                near = (d, ex, ey)
+        self.quiet = self.quiet + 1 if near is None else 0
+
+        self._collapse_check(me, tick, near is not None)
+
         guards = sorted(
             bid for bid, role in self.role.items()
             if role == ROLE_ESCORT and me[bid].class_ == BotClass.Battle
         )
-        reach = self.conf.bot.blaster_range + GUARD_ALERT_MARGIN
-        near = None
-        for _, ex, ey in self._enemy_pts:
-            d = math.hypot(ex - self.dep_x, ey - self.dep_y)
-            if d <= reach and (near is None or d < near[0]):
-                near = (d, ex, ey)
 
         if near is None or not guards:
             if self.alert:
@@ -783,6 +862,52 @@ class Plan:
             self.alert = True
             self.alert_at = (ex, ey)
             self.alert_tick = tick
+
+    def _collapse_check(self, me, tick, attacked):
+        """Send the guard to the payload if the enemy leaves the extraction site alone.
+
+        Only the guard's shooters and healer go; the extractors stay and keep mining. It
+        happens once the deposit has had no enemy near it for COLLAPSE_QUIET_TICKS, from
+        COLLAPSE_AFTER_TICK onwards. If an enemy does turn up at the deposit while the
+        collapsed bots are still within RECALL_RANGE of it, they go back to guarding;
+        further away than that the trip back would take too long to matter, so they carry on.
+        """
+        if not COLLAPSE_ENABLED:
+            return
+
+        if attacked:
+            for bid in list(self.collapsed):
+                bot = me.get(bid)
+                if bot is None or self.role.get(bid) != ROLE_ATTACK:
+                    self.collapsed.discard(bid)
+                    continue
+                if _dist(bot.pos.x, bot.pos.y, self.dep_x, self.dep_y) <= RECALL_RANGE:
+                    self.role[bid] = ROLE_ESCORT
+                    self.ring_of.pop(bid, None)
+                    self.collapsed.discard(bid)
+                    print(f"[plan] tick {tick}: enemy at the deposit, bot {bid} returns to guard")
+                else:
+                    self.collapsed.discard(bid)   # too far to matter: it stays on the payload
+            return
+
+        if tick < COLLAPSE_AFTER_TICK or self.quiet < COLLAPSE_QUIET_TICKS:
+            return
+        moved = 0
+        for bid, role in list(self.role.items()):
+            if role != ROLE_ESCORT:
+                continue
+            self.role[bid] = ROLE_ATTACK
+            self.dep_book.drop(bid)
+            self.post.pop(bid, None)
+            self.collapsed.add(bid)
+            moved += 1
+        if moved:
+            self.alert = False
+            self.calm = 0
+            print(
+                f"[plan] tick {tick}: deposit quiet for {self.quiet} ticks -- "
+                f"{moved} guard bots collapse on the payload"
+            )
 
     def _plan_defense(self, guards, me, ex, ey):
         """Send the guard shooters to the spots nearest the enemy, quickest arrival first.
@@ -818,7 +943,7 @@ class Plan:
         """How near the front a spot is: distance to the nearest enemy (smaller = more
         exposed), or to the enemy's spawn when none is on the field."""
         best = None
-        for _, ex, ey in self._enemy_pts:
+        for _, ex, ey in self._threat_pts:
             d = math.hypot(ex - x, ey - y)
             if best is None or d < best:
                 best = d
@@ -837,7 +962,7 @@ class Plan:
         px, py = bot.pos.x, bot.pos.y
         reach = self.conf.bot.blaster_range + COVER_TRIGGER
         nearest = None
-        for _, ex, ey in self._enemy_pts:
+        for _, ex, ey in self._threat_pts:
             d = math.hypot(ex - px, ey - py)
             if d <= reach and (nearest is None or d < nearest[0]):
                 nearest = (d, ex, ey)
@@ -897,7 +1022,7 @@ class Plan:
     # spacing
     # ---------------------------------------------------------------------------------
 
-    def _spread(self, me, enemies, des, conf):
+    def _spread(self, me, des, conf):
         speed = conf.bot.speed
         ids = list(me)
 
@@ -905,7 +1030,7 @@ class Plan:
         for bid in ids:
             p = me[bid].pos
             threatened[bid] = any(
-                _dist(p.x, p.y, e.pos.x, e.pos.y) <= self.threat_range for e in enemies
+                _dist(p.x, p.y, ex, ey) <= self.threat_range for _, ex, ey in self._threat_pts
             )
 
         q = {
@@ -913,9 +1038,18 @@ class Plan:
             for bid in ids
         }
 
+        # In a narrow spot (a 2-wide gap, a corner) sideways pushing just jams bots against the
+        # walls, so there the rule is a queue instead: a bot only slows for whoever is ahead of
+        # it, and the one in front is never held up.
+        tight = {
+            bid: not disc_free(Vec2(me[bid].pos.x, me[bid].pos.y), self.conf.bot.radius + 0.55)
+            for bid in ids
+        }
+
         final = {}
         for i in ids:
             rx = ry = 0.0
+            slow = 1.0
             for j in ids:
                 if i == j:
                     continue
@@ -924,6 +1058,11 @@ class Plan:
                 dx, dy = q[i][0] - q[j][0], q[i][1] - q[j][1]
                 d = math.hypot(dx, dy)
                 if d >= self.rep_start:
+                    continue
+                if tight[i]:
+                    ahead = des[i][0] * (q[j][0] - q[i][0]) + des[i][1] * (q[j][1] - q[i][1])
+                    if ahead > 0.0:
+                        slow = min(slow, max(0.0, (d - self.hard) / (self.rep_start - self.hard)))
                     continue
                 sign = 1.0 if i > j else -1.0
                 if d < 1e-4:
@@ -938,8 +1077,85 @@ class Plan:
                 s = min(1.0, (self.rep_start - d) / (self.rep_start - self.hard)) * 1.5
                 rx += ux * s
                 ry += uy * s
-            final[i] = _clip(des[i][0] + rx, des[i][1] + ry, 1.0)
+            if tight[i]:
+                final[i] = (des[i][0] * slow, des[i][1] * slow)
+            else:
+                final[i] = _clip(des[i][0] + rx, des[i][1] + ry, 1.0)
         return final
+
+    # ---------------------------------------------------------------------------------
+    # getting unstuck
+    # ---------------------------------------------------------------------------------
+
+    def _stuck_check(self, bid, bot, target, des, tick):
+        """Watch one bot for lack of progress; return an escape direction while it is stuck.
+
+        A bot is stuck if, over the last STUCK_WINDOW ticks, it wanted to move on nearly every
+        tick and yet ended up less than STUCK_MIN_MOVE from where it started, with somewhere
+        still to go. It then ignores spacing for up to STUCK_ESCAPE_TICKS (or until it is
+        STUCK_CLEAR_DIST clear of where it got wedged) and steers by `_unstick_dir`.
+        """
+        hist = self.hist.setdefault(bid, [])
+        wants = target is not None and math.hypot(des[0], des[1]) >= 0.5
+        hist.append((bot.pos.x, bot.pos.y, wants))
+        if len(hist) > STUCK_WINDOW + 1:
+            hist.pop(0)
+
+        esc = self.escape.get(bid)
+        if esc is not None:
+            done = (
+                tick >= esc[2]
+                or target is None
+                or _dist(bot.pos.x, bot.pos.y, esc[0], esc[1]) >= STUCK_CLEAR_DIST
+            )
+            if done:
+                del self.escape[bid]
+                hist.clear()
+                return None
+            return self._unstick_dir(bot, target)
+
+        if target is None or len(hist) < STUCK_WINDOW + 1:
+            return None
+        moved = _dist(bot.pos.x, bot.pos.y, hist[0][0], hist[0][1])
+        tried = sum(1 for _, _, w in hist if w)
+        if (tried >= 0.8 * len(hist) and moved < STUCK_MIN_MOVE
+                and _dist(bot.pos.x, bot.pos.y, target[0], target[1]) > 1.5):
+            self.escape[bid] = (bot.pos.x, bot.pos.y, tick + STUCK_ESCAPE_TICKS)
+            print(
+                f"[plan] tick {tick}: bot {bid} stuck at ({bot.pos.x:.1f}, {bot.pos.y:.1f}), "
+                f"steering out"
+            )
+            return self._unstick_dir(bot, target)
+        return None
+
+    def _unstick_dir(self, bot, target):
+        """A unit direction that gets a wedged bot moving: of the ways it can really walk, the
+        one that leaves the shortest route to where it is going.
+
+        Path length is the engine's own walking distance around walls, so a step that
+        reduces it is real progress even when the straight line to the target is blocked.
+        """
+        here = Vec2(bot.pos.x, bot.pos.y)
+        goal = Vec2(target[0], target[1])
+        best = None
+        for step in (0.6, 0.3):
+            for k in range(16):
+                a = math.radians(22.5 * k)
+                ux, uy = math.cos(a), math.sin(a)
+                q = Vec2(bot.pos.x + ux * step, bot.pos.y + uy * step)
+                if not corridor_clear(here, q):
+                    continue
+                length = path_length(q, goal)
+                if length is None:
+                    continue
+                if best is None or length < best[0]:
+                    best = (length, ux, uy)
+            if best is not None:
+                break
+        if best is None:
+            v = navigate_to(here, goal)   # nothing better to try: what the engine suggests
+            return _clip(v.x, v.y, 1.0)
+        return (best[1], best[2])
 
     # ---------------------------------------------------------------------------------
     # battle bots
