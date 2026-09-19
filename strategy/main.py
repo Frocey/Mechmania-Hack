@@ -115,6 +115,15 @@ GATE_SEEDS = [(30.5, 28.5), (22.5, 23.5), (1.5, 23.5)]
 # first (nearer = heavier); the counts are smoothed and added to a prior that favours the gate
 # on the enemy's shortest route to our deposit. Defenders are only moved between gates when a
 # gate is REBALANCE_SLACK men short, and at most once per REBALANCE_TICKS.
+#
+# The payload counts most of all: it is what wins or loses the game, and the enemy's shooters
+# roam. While the payload is on our side of centre (capture below PAYLOAD_THREAT_C), the first of
+# our gates that its path to our base comes within PAYLOAD_GATE_R of gets PAYLOAD_GATE_WEIGHT on
+# top, enough to outweigh a scattered enemy, so the army gathers where the payload is going and new
+# shooters join it there instead of standing guard where nothing is coming.
+PAYLOAD_GATE_WEIGHT = 12.0
+PAYLOAD_GATE_R = 6.0
+PAYLOAD_THREAT_C = 0.05
 PRESSURE_TICKS = 15
 PRESSURE_RANGE = 90.0
 PRIOR_PRIMARY = 0.5
@@ -255,14 +264,31 @@ PUSH_EARLY_TICKS = 0
 #   losing (capture at or below -DEFEND_ENTER): go back and DEFEND our own gates, i.e. the
 #       chokes between the payload and our base, aggressively (STANCE_DEFEND), and keep doing so
 #       until the payload is back at centre (DEFEND_EXIT).
-# Exception: if the enemy has no shooters left, or we out-number them AGGR_OUTNUMBER to 1 (kept
-# until it falls below AGGR_KEEP), a losing team goes and takes the payload instead. A stance is
-# kept for at least STANCE_MIN_TICKS before it can change.
+# A losing team does not defend for ever, because sitting still loses on timeout. It goes and
+# takes the payload instead (see Plan._should_attack) when any of these holds:
+#   * the enemy has no shooters left;
+#   * we are stronger overall: our force (shooters + half a point per healer) is at least
+#     AGGR_OUTNUMBER times theirs (and, once attacking, stays at least AGGR_KEEP times theirs);
+#   * few enemy shooters are anywhere near the payload: we out-number those within NEAR_PAYLOAD_R
+#     of it AGGR_NEAR to 1 (they have retreated, so the payload is there for the taking);
+#   * time is running out: the ticks left are no more than TIME_FACTOR times what it would take to
+#     push the payload back to centre, plus the walk there, plus TIME_SLACK. Then it is attack or
+#     lose, whatever the odds.
+# A stance is kept for at least STANCE_MIN_TICKS before it can change.
 DEFEND_ENTER = 0.04
 DEFEND_EXIT = 0.0
-AGGR_OUTNUMBER = 2.0
-AGGR_KEEP = 1.3
+AGGR_OUTNUMBER = 1.15
+AGGR_KEEP = 0.9
+AGGR_NEAR = 2.0
+NEAR_PAYLOAD_R = 16.0
+TIME_FACTOR = 1.25
+TIME_SLACK = 300
 STANCE_MIN_TICKS = 120
+# The army is one group. It is split between gates only if a second gate's claim is at least
+# SPLIT_FRACTION of the strongest gate's AND each group would have at least MIN_GROUP shooters;
+# otherwise everybody goes to the strongest gate. No lone sentries at the other gates.
+SPLIT_FRACTION = 0.6
+MIN_GROUP = 5
 # On the march the team stays together: a bot more than MARCH_SPREAD nearer the payload than the
 # group's median waits for the rest instead of walking into the enemy alone.
 MARCH_SPREAD = 4.0
@@ -382,6 +408,10 @@ class Plan:
         self.cover_since = {}    # shooter id -> tick it went into cover
         self.in_cover = set()    # shooters that are in cover this tick
         self.stance_since = 0    # tick the current late-game stance began
+        self._capture = 0.0
+        self._enemy_healers = 0
+        self._last_pos = {}
+        self._pay = None
         self.last_miner_plan = -10 ** 9
         self.hist = {}          # bot id -> recent (x, y, wanted_to_move) for the stuck check
         self.escape = {}        # bot id -> (x, y, until_tick) while it steers out of a jam
@@ -570,10 +600,39 @@ class Plan:
         wmin = min(widths)
         k = next(j for j, w in enumerate(widths) if w <= wmin + GATE_TIE)
         ci = lo + k
-        gate = Gate(route[ci][0], route[ci][1], route[max(0, ci - GATE_LANE):ci],
-                    route[ci:ci + GATE_EXIT])
+        # The kill zone is the doorway line itself (across the narrowest point) as well as the
+        # route just past it: the group should be able to hit an enemy the moment it steps into the
+        # doorway, not only after it has walked through.
+        exit_pts = self._doorway_line(route, ci) + route[ci:ci + GATE_EXIT]
+        gate = Gate(route[ci][0], route[ci][1], route[max(0, ci - GATE_LANE):ci], exit_pts)
         gate.width = wmin
         return gate
+
+    def _doorway_line(self, route, i):
+        """Points across the route at sample i, at right angles to it, 0.6 apart, as far to each
+        side as a bot can stand: the doorway as a line."""
+        px, py = route[i]
+        ax, ay = route[max(0, i - 1)]
+        bx, by = route[min(len(route) - 1, i + 1)]
+        dx, dy = bx - ax, by - ay
+        n = math.hypot(dx, dy)
+        if n < 1e-9:
+            return [(px, py)]
+        nx, ny = -dy / n, dx / n
+        extent = []
+        for sgn in (1.0, -1.0):
+            reach = 0.0
+            while reach < 6.0 and point_free(
+                Vec2(px + sgn * nx * (reach + 0.25), py + sgn * ny * (reach + 0.25))
+            ):
+                reach += 0.25
+            extent.append(reach)
+        out = []
+        t = -extent[1]
+        while t <= extent[0] + 1e-9:
+            out.append((px + nx * t, py + ny * t))
+            t += 0.6
+        return out or [(px, py)]
 
     def _find_gates(self):
         goal = Vec2(self.goal[0], self.goal[1])
@@ -720,6 +779,11 @@ class Plan:
         weights = [1.0] * n_static + [w for _, _, w in targets]
         vis, terms, dist, pos, rows, elig = {}, {}, {}, {}, [], []
         fx, fy = g.focus
+        # A shot stops on the payload, so where it is now matters for who can hit whom.
+        dyn_solid = g.solid
+        if dyn_solid is None and self._pay is not None:
+            if _dist(self._pay[0].x, self._pay[0].y, g.cx, g.cy) <= 14.0:
+                dyn_solid = self._pay
         for idx in g.cands:
             x, y = g.grid[idx]
             # Only the spots around where the group already is are considered: that is what makes
@@ -732,7 +796,7 @@ class Plan:
             if targets:
                 here = Vec2(x, y)
                 for j, (tx, ty, _) in enumerate(targets):
-                    if _dist(x, y, tx, ty) <= rng - 1.0 and self._sees(here, tx, ty, g.solid):
+                    if _dist(x, y, tx, ty) <= rng - 1.0 and self._sees(here, tx, ty, dyn_solid):
                         v.append(n_static + j)
             d = _dist(x, y, g.cx, g.cy)
             hug = g.hug.get(idx, False)
@@ -975,6 +1039,10 @@ class Plan:
             (payload, conf.payload.radius),
         ]
         self._enemy_pts = [(e.id, e.pos.x, e.pos.y) for e in enemies]
+        self._capture = state.capture
+        self._enemy_healers = sum(1 for e in enemies if e.class_ == BotClass.Healer)
+        self._last_pos = {bid: (bot.pos.x, bot.pos.y) for bid, bot in me.items()}
+        self._pay = (payload, conf.payload.radius)
         # Only enemy shooters are a danger to stand near: extractors and healers cannot hurt us.
         self._threat_pts = [
             (e.id, e.pos.x, e.pos.y) for e in enemies if e.class_ == BotClass.Battle
@@ -1001,8 +1069,7 @@ class Plan:
         for bid, bot in me.items():
             if bot.class_ != BotClass.Battle:
                 targets[bid] = self._cover_target(bot, targets[bid], me)
-        if self.mode == "push":
-            self._march_together(me, targets, state)
+        self._stay_together(me, targets, state)
 
         des = {}
         for bid, bot in me.items():
@@ -1136,11 +1203,7 @@ class Plan:
 
         losing = c < DEFEND_EXIT if self.mode == "defend" else c <= -DEFEND_ENTER
         if losing:
-            # A losing team that clearly out-numbers the enemy (or has nothing left to fight)
-            # takes the payload back rather than waiting for it.
-            ratio = AGGR_KEEP if (self.mode == "push" and c < 0) else AGGR_OUTNUMBER
-            strong = theirs == 0 or mine >= ratio * theirs
-            want = "push" if strong else "defend"
+            want = "push" if self._should_attack(state, c) else "defend"
         else:
             want = "push" if self.mode in ("home", "defend") else None
 
@@ -1158,6 +1221,46 @@ class Plan:
             elif self.mode == "hold" and remaining >= REPUSH_ARC:
                 self.mode = "push"
                 print(f"[plan] tick {tick}: payload knocked back (capture {c:.3f}) -- pushing")
+
+    def _should_attack(self, state, c):
+        """We are losing the payload (it is on our side). Should we go and take it back?
+
+        See the comment on AGGR_OUTNUMBER: yes if the enemy is gone, or we are stronger, or few
+        of them are near the payload, or there is no time left to wait.
+        """
+        conf = self.conf
+        ours = {b for b, r in self.role.items() if r == ROLE_DEFENDER and b in self.cls}
+        my_force = sum(
+            1.0 if self.cls[b] == BotClass.Battle else 0.5 for b in ours
+        )
+        their_force = len(self._threat_pts) + 0.5 * self._enemy_healers
+        if not self._threat_pts:
+            return True
+
+        # time: can we still afford to wait? (ticks to push the payload back to centre, plus the
+        # walk there from where the team is, plus a margin)
+        p = state.payload_pos()
+        push_ticks = (-c) * self.path_len / conf.payload.speed
+        pts = [self._last_pos[b] for b in ours if b in self._last_pos]
+        if pts:
+            mx = sum(q[0] for q in pts) / len(pts)
+            my = sum(q[1] for q in pts) / len(pts)
+            walk = path_length(Vec2(mx, my), Vec2(p.x, p.y))
+            if walk is None:
+                walk = 1.4 * _dist(mx, my, p.x, p.y)
+            walk_ticks = walk / conf.bot.speed
+        else:
+            walk_ticks = 600.0
+        ticks_left = conf.max_ticks - state.tick
+        if ticks_left <= TIME_FACTOR * (push_ticks + walk_ticks) + TIME_SLACK:
+            return True
+
+        # odds: overall, and around the payload
+        ratio = AGGR_KEEP if self.mode == "push" else AGGR_OUTNUMBER
+        if my_force >= ratio * their_force:
+            return True
+        near = sum(1 for _, ex, ey in self._threat_pts if _dist(ex, ey, p.x, p.y) <= NEAR_PAYLOAD_R)
+        return my_force >= AGGR_NEAR * max(1, near)
 
     def _enter(self, new, tick, c, mine, theirs):
         """Switch stance, moving the team onto the right front (our gates, or the payload's)."""
@@ -1293,8 +1396,9 @@ class Plan:
     # holding the gates
     # ---------------------------------------------------------------------------------
 
-    def _apportion(self, n, weights):
-        """Split n men between the gates in proportion to their weights."""
+    @staticmethod
+    def _split(n, weights):
+        """n men in proportion to the weights, whole numbers, adding up to n."""
         total = sum(weights)
         if n <= 0 or total <= 0.0:
             return [0] * len(weights)
@@ -1303,6 +1407,29 @@ class Plan:
         left = n - sum(counts)
         for i in sorted(range(len(weights)), key=lambda i: shares[i] - counts[i], reverse=True)[:left]:
             counts[i] += 1
+        return counts
+
+    def _apportion(self, n, weights):
+        """How many men each gate gets: one group at the strongest gate, unless it is worth two.
+
+        A gate other than the strongest only gets men if its claim is at least SPLIT_FRACTION of
+        the strongest's and every group that results has MIN_GROUP or more. Otherwise everybody goes
+        to the strongest gate, so there are no lone sentries at the others, and the army fights
+        as one body.
+        """
+        counts = [0] * len(weights)
+        if n <= 0 or sum(weights) <= 0.0:
+            return counts
+        top = max(range(len(weights)), key=lambda i: weights[i])
+        chosen = [i for i in range(len(weights)) if weights[i] >= SPLIT_FRACTION * weights[top]]
+        while len(chosen) > 1:
+            shares = self._split(n, [weights[i] for i in chosen])
+            if all(s >= MIN_GROUP for s in shares):
+                for i, s in zip(chosen, shares):
+                    counts[i] = s
+                return counts
+            chosen.remove(min(chosen, key=lambda i: weights[i]))
+        counts[top] = n
         return counts
 
     def _update_pressure(self):
@@ -1319,9 +1446,33 @@ class Plan:
                     best = (d, gi)
             if best is not None and best[0] <= PRESSURE_RANGE:
                 raw[best[1]] += 1.0 + (PRESSURE_RANGE - best[0]) / PRESSURE_RANGE
+        bonus = self._payload_gate_bonus()
         for gi in range(n_g):
             self.pressure[gi] = 0.8 * self.pressure[gi] + 0.2 * raw[gi]
-            self.weights[gi] = PRIOR_WEIGHT * self.gates[gi].prior + self.pressure[gi]
+            self.weights[gi] = (
+                PRIOR_WEIGHT * self.gates[gi].prior + self.pressure[gi] + bonus[gi]
+            )
+
+    def _payload_gate_bonus(self):
+        """Extra weight for the gate the payload is heading for.
+
+        Only while we are defending (home or defend stance) and the payload is on our side of
+        centre. Follows the payload's path from where it is now towards our base (in our frame,
+        negative capture runs that way) and picks the first gate that path passes within
+        PAYLOAD_GATE_R of: the next one it has to come through.
+        """
+        bonus = [0.0] * len(self.gates)
+        if self.mode not in ("home", "defend") or self._capture >= PAYLOAD_THREAT_C:
+            return bonus
+        t = self._capture
+        while t >= -1.0:
+            p = payload_pos(t)
+            for gi, g in enumerate(self.gates):
+                if _dist(p.x, p.y, g.cx, g.cy) <= PAYLOAD_GATE_R:
+                    bonus[gi] = PAYLOAD_GATE_WEIGHT
+                    return bonus
+            t -= 0.01
+        return bonus
 
     def _busy(self):
         """Standing spots that are not free: defenders' spots, plus (while the defenders are on
@@ -1845,26 +1996,40 @@ class Plan:
             idx = self._hold_flank(bid, bot, idx)     # (a wounded bot stays with its healer)
         return self.fgrid[idx]
 
-    def _march_together(self, me, targets, state):
-        """On the march the team arrives as a group, not as a trickle.
+    def _stay_together(self, me, targets, state):
+        """The army arrives as a group, not as a trickle, whether it is marching to the payload or
+        relocating to another gate.
 
-        A bot that is more than MARCH_SPREAD nearer the payload than the group's median waits
-        where it is until the rest close up (unless it is already at the payload, or an enemy
-        shooter is close and it is fighting anyway).
+        Each group (the whole army when marching; the men at one gate otherwise) has a reference
+        point: the payload, or the gate's focus. A bot that is still far from it (over 6 units) but
+        more than MARCH_SPREAD nearer than the group's median waits where it is until the rest close
+        up, unless an enemy shooter is close and it is fighting anyway. Bots already at the point,
+        and late arrivals coming up behind, are unaffected.
         """
-        ids = [b for b, r in self.role.items()
-               if r == ROLE_DEFENDER and b in me and targets.get(b) is not None]
-        if len(ids) < 3:
-            return
-        p = state.payload_pos()
-        dist = {b: _dist(me[b].pos.x, me[b].pos.y, p.x, p.y) for b in ids}
-        median = sorted(dist.values())[len(ids) // 2]
+        groups = []
+        if self.mode == "push":
+            p = state.payload_pos()
+            ids = [b for b, r in self.role.items()
+                   if r == ROLE_DEFENDER and b in me and targets.get(b) is not None]
+            groups.append(((p.x, p.y), ids))
+        else:
+            for gi, g in enumerate(self.gates):
+                ids = [b for b, gj in self.gate_of.items()
+                       if gj == gi and b in me and targets.get(b) is not None
+                       and b not in self.recovering]
+                groups.append((g.focus, ids))
+
         near = self.conf.bot.blaster_range + 4.0
-        for b in ids:
-            if dist[b] > 5.0 and dist[b] < median - MARCH_SPREAD:
-                bx, by = me[b].pos.x, me[b].pos.y
-                if not any(_dist(bx, by, ex, ey) <= near for _, ex, ey in self._threat_pts):
-                    targets[b] = (bx, by)
+        for ref, ids in groups:
+            if len(ids) < 3:
+                continue
+            dist = {b: _dist(me[b].pos.x, me[b].pos.y, ref[0], ref[1]) for b in ids}
+            median = sorted(dist.values())[len(ids) // 2]
+            for b in ids:
+                if dist[b] > 6.0 and dist[b] < median - MARCH_SPREAD:
+                    bx, by = me[b].pos.x, me[b].pos.y
+                    if not any(_dist(bx, by, ex, ey) <= near for _, ex, ey in self._threat_pts):
+                        targets[b] = (bx, by)
 
     def _valid_ring(self, state):
         if self._ring_tick == state.tick:
