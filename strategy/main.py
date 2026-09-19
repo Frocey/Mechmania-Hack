@@ -192,13 +192,36 @@ PEEK_VOLLEY_RATIO = 2.0
 PEEK_READY_WIN = 10
 PEEK_SCAN_TICKS = 12
 PEEK_GUARDS = 3
+# Stall-breaker: if no blaster has fired anywhere (either side) for STALL_TICKS, the safe-peek rule
+# relaxes: our shooters step out as a volley as soon as as many are ready as there are enemies
+# that could answer, so a standoff cannot go on for ever.
+STALL_TICKS = 300
+# Never still: a shooter waiting hidden for its blaster shifts between its HIDE point and a second
+# hidden point every PEEK_SWAY_TICKS (offset by its id, so they are not all in step); and while
+# nothing is in range the whole blob drifts in a slow circle of radius SWAY_R (one common offset,
+# so it moves as one body), taking SWAY_PERIOD ticks a lap. (No drift while holding the payload
+# doorways: the payload must not be pushed past its hold point.)
+PEEK_SWAY_TICKS = 25
+SWAY_R = 0.6
+SWAY_PERIOD = 240
 
 # --- healers: a hub well behind the front ---------------------------------------------------
 # Healers stand in a hub HUB_BEHIND behind the shooters' centre (on the side away from the gate or
 # the enemy), out of sight of the enemy, within HUB_RADIUS of that point. Wounded shooters fall
 # back all the way to it to be healed, so the enemy's fire never reaches the healers first.
-HUB_BEHIND = 4.5
-HUB_RADIUS = 3.0
+HUB_BEHIND = 4.0
+HUB_RADIUS = 2.5
+
+# --- one group, always together -------------------------------------------------------------
+# The army is a single blob. It is never split between gates (ALLOW_SPLIT), everyone's target is kept
+# within TOGETHER_R of the group's centre (anyone whose is not is sent to the centre), a group that
+# is relocating or marching waits for its stragglers (see MARCH_SPREAD), and in an assault nobody
+# leaves to push: the blob stands on the payload and pushes it as one body (PUSH_BONUS pulls the
+# front spots onto the payload whenever no enemy shooter is within PUSH_CLEAR of it).
+ALLOW_SPLIT = False
+TOGETHER_R = 9.0
+PUSH_BONUS = 3.0
+PUSH_RING = 2.4
 RELAYOUT_TICKS = 10
 STICKY_BONUS = 1.5
 FRONT_DEFAULT = 14           # front size before there is a group to size it by (start-up)
@@ -343,7 +366,7 @@ STANDSTILL_C = 0.003
 TRANSIT_R = 3.5
 TRANSIT_COHESION = 0.7
 TRANSIT_STEP = 0.5
-PUSHERS = 4
+PUSHERS = 0                 # nobody leaves the group to push (see TOGETHER_R above)
 PUSH_CLEAR = 6.0
 ASSAULT_FAR = 9.0
 # The army is one group. It is split between gates only if a second gate's claim is at least
@@ -353,7 +376,7 @@ SPLIT_FRACTION = 0.6
 MIN_GROUP = 5
 # On the march the team stays together: a bot more than MARCH_SPREAD nearer the payload than the
 # group's median waits for the rest instead of walking into the enemy alone.
-MARCH_SPREAD = 4.0
+MARCH_SPREAD = 3.0
 
 ROLE_MINER = "miner"        # extractor at our deposit
 ROLE_DEFENDER = "defender"  # shooter / healer: holds the gates, later escorts/holds the payload
@@ -436,6 +459,7 @@ class Gate:
         self.solid = None         # (centre, radius) that blocks shots here, e.g. the payload
         self.far = FAR_SPOT       # spots further than this from the gate are not front spots
         self.quality = set()      # the front spots right now (see Plan._rescore)
+        self.pull = None          # (x, y): spots within PUSH_RING of it get PUSH_BONUS (assault push)
         self.last_layout = -10 ** 9
         self.sig = None
 
@@ -473,6 +497,11 @@ class Plan:
         self.cover_since = {}    # shooter id -> tick it went into cover
         self.in_cover = set()    # shooters that are in cover this tick
         self.pk = {}             # shooter id -> its current peek points (see the edge peek above)
+        self._prev_nft = {}      # our shooter id -> its blaster's next_fire_tick last tick
+        self._prev_enft = {}     # enemy shooter id -> the same
+        self._last_shot = 0      # tick a blaster (either side) last fired
+        self._sway_on = False    # the blob drifts this tick (nothing in range)
+        self._tick_no = 0
         self._einfo = {}         # enemy id -> (predicted x, y, is_shooter, ticks to ready, health, inv)
         self.stance_since = 0    # tick the current late-game stance began
         self.pushers = set()     # shooters pushing the payload (assault stance, no enemy near it)
@@ -904,6 +933,8 @@ class Plan:
                 term -= HUG_PENALTY
             if d > g.far:
                 term -= d - g.far
+            if g.pull is not None and _dist(x, y, g.pull[0], g.pull[1]) <= PUSH_RING:
+                term += PUSH_BONUS            # no enemy shooter near: the blob stands on the payload
             vis[idx], terms[idx], dist[idx] = v, term, d
             seen_w = sum(weights[t] for t in v)
             rows.append((seen_w + term, -d, idx))
@@ -1126,6 +1157,7 @@ class Plan:
             self._setup(state, conf)
 
         tick = state.tick
+        self._tick_no = tick
         me = {b.id: b for b in state.fleet_me}
         enemies = [e for e in state.fleet_other]
 
@@ -1158,8 +1190,27 @@ class Plan:
                 e.invulnerable_until_tick,
             )
 
+        # A blaster's next_fire_tick changes when it fires: note when anyone (either side) last did.
+        for b, bot in me.items():
+            if bot.class_ == BotClass.Battle:
+                v = bot.next_fire_tick
+                if b in self._prev_nft and self._prev_nft[b] != v:
+                    self._last_shot = tick
+                self._prev_nft[b] = v
+        for e in enemies:
+            if e.class_ == BotClass.Battle:
+                v = e.next_fire_tick
+                if e.id in self._prev_enft and self._prev_enft[e.id] != v:
+                    self._last_shot = tick
+                self._prev_enft[e.id] = v
+
         self._sync_roles(me, tick)
         self._update_mode(state, tick)
+        # Nothing in range of any gate: the blob is free to drift (see SWAY_R).
+        self._sway_on = self.mode in ("home", "defend") and not any(
+            _dist(ex, ey, g.cx, g.cy) <= DYN_RANGE for _, ex, ey in self._threat_pts
+            for g in self.gates
+        )
         holding = self.mode == "home"
 
         action = FleetAction.new()
@@ -1569,6 +1620,9 @@ class Plan:
         if n <= 0 or sum(weights) <= 0.0:
             return counts
         top = max(range(len(weights)), key=lambda i: weights[i])
+        if not ALLOW_SPLIT:
+            counts[top] = n                    # one group, always: everybody to the strongest gate
+            return counts
         chosen = [i for i in range(len(weights)) if weights[i] >= SPLIT_FRACTION * weights[top]]
         while len(chosen) > 1:
             shares = self._split(n, [weights[i] for i in chosen])
@@ -2025,6 +2079,13 @@ class Plan:
             advance += len(healthy) / near - 1.0
         advance = max(-1.0, min(1.0, advance))
         sticky = {self.spot_of[b] for b in healthy if b in self.spot_of}
+        # In an assault with no enemy shooter near the payload, pull the whole blob onto it: it
+        # pushes as one body, and nobody has to leave the group to do it.
+        g.pull = None
+        if self.mode == "assault" and not any(
+            _dist(ex, ey, g.cx, g.cy) <= PUSH_CLEAR for _, ex, ey in self._threat_pts
+        ):
+            g.pull = (g.cx, g.cy)
         self._rescore(g, self._dynamic_targets(gi, aggressive), lane_w,
                       n_front=len(healthy), sticky=sticky, advance=advance, avoid=busy)
         if self.mode == "assault" and not g.quality and healthy:
@@ -2257,7 +2318,23 @@ class Plan:
             if bid in self.in_cover and bid in self.cover_of:
                 return self.fgrid[self.cover_of[bid]]  # reloading: wait out of sight
             idx = self._hold_flank(bid, bot, idx)     # (a wounded bot stays with its healer)
-        return self.fgrid[idx]
+        x, y = self.fgrid[idx]
+
+        gi = self.gate_of.get(bid)
+        g = self.gates[gi] if gi is not None and gi < len(self.gates) else None
+        if g is not None:
+            # Always together: a target far from the group's centre is no use to anyone. Go to the
+            # group (its best front spot) instead of standing alone.
+            if _dist(x, y, g.focus[0], g.focus[1]) > TOGETHER_R and g.order:
+                return self.fgrid[g.order[0]]
+            # Never still: while nothing is in range the whole blob drifts in one slow circle.
+            # (Every bot gets the same offset, so it moves as a single body.)
+            if self._sway_on:
+                a = 2.0 * math.pi * self._tick_no / SWAY_PERIOD
+                sx, sy = x + SWAY_R * math.cos(a), y + SWAY_R * math.sin(a)
+                if self._standable(sx, sy):
+                    return (sx, sy)
+        return (x, y)
 
     def _update_pushers(self, me, state, payload):
         """In an assault, pick the shooters that push the payload: only while it is safe to.
@@ -2309,9 +2386,11 @@ class Plan:
             if len(ids) < 3:
                 continue
             dist = {b: _dist(me[b].pos.x, me[b].pos.y, ref[0], ref[1]) for b in ids}
-            median = sorted(dist.values())[len(ids) // 2]
+            # wait for the stragglers, not just the middle of the group: the reference is the
+            # three-quarter mark, so only the slowest quarter is being waited for
+            slow = sorted(dist.values())[min(len(ids) - 1, (3 * len(ids)) // 4)]
             for b in ids:
-                if dist[b] > 6.0 and dist[b] < median - MARCH_SPREAD:
+                if dist[b] > 6.0 and dist[b] < slow - MARCH_SPREAD:
                     bx, by = me[b].pos.x, me[b].pos.y
                     if not any(_dist(bx, by, ex, ey) <= near for _, ex, ey in self._threat_pts):
                         targets[b] = (bx, by)
@@ -2705,18 +2784,27 @@ class Plan:
         pairs.sort()
         for _, o, h in pairs[:6]:
             if corridor_clear(Vec2(h[0], h[1]), Vec2(o[0], o[1])):
-                return {"t": tick, "h0": H0, "hide": h, "out": o, "eid": tid}
+                # a second hidden point to shift to while waiting, so a bot is never standing still
+                h2 = None
+                for p in hides:
+                    d = _dist(p[0], p[1], h[0], h[1])
+                    if 0.5 <= d <= 1.4 and corridor_clear(Vec2(h[0], h[1]), Vec2(p[0], p[1])):
+                        if h2 is None or abs(d - 0.9) < abs(_dist(h2[0], h2[1], h[0], h[1]) - 0.9):
+                            h2 = p
+                return {"t": tick, "h0": H0, "hide": h, "hide2": h2, "out": o, "eid": tid}
         return None
 
-    def _peek_ok(self, out, ready_n):
+    def _peek_ok(self, out, ready_n, stalled):
         """Is it safe to step out to `out` now: could any enemy shooter answer? An enemy answers if
         it is ready within PEEK_RESPONSE ticks and can see `out`. Safe if none can, or if we have at
-        least PEEK_VOLLEY_RATIO times as many shooters ready as there are enemies that could."""
+        least PEEK_VOLLEY_RATIO times as many shooters ready as there are enemies that could; after
+        a stall (no blaster fired for STALL_TICKS) as many ready as could answer is enough."""
         responders = 0
         for px, py, shooter, wait, _, _ in self._einfo.values():
             if shooter and wait <= PEEK_RESPONSE and self._exposed(out[0], out[1], px, py):
                 responders += 1
-        return responders == 0 or ready_n >= PEEK_VOLLEY_RATIO * responders
+        ratio = 1.0 if stalled else PEEK_VOLLEY_RATIO
+        return responders == 0 or ready_n >= ratio * responders
 
     def _peek_moves(self, me, targets, des, tick):
         """Override the movement of every engaged, healthy shooter with the edge peek.
@@ -2739,6 +2827,7 @@ class Plan:
         ]
         ready = {b: max(0, me[b].next_fire_tick - tick) for b in shooters}
         ready_n = sum(1 for w in ready.values() if w <= PEEK_READY_WIN)
+        stalled = tick - self._last_shot >= STALL_TICKS
 
         for b in shooters:
             H0 = self.fgrid[self.spot_of[b]]
@@ -2765,14 +2854,20 @@ class Plan:
                 continue
 
             hide, out = st["hide"], st["out"]
-            travel = _dist(hide[0], hide[1], out[0], out[1]) / speed
+            travel = _dist(px, py, out[0], out[1]) / speed        # from where it stands right now
             tx, ty = self._einfo[st["eid"]][0], self._einfo[st["eid"]][1]
             go = (
                 ready[b] <= travel + PEEK_LEAD
                 and self._exposed(out[0], out[1], tx, ty)     # it can still hit its target from OUT
-                and self._peek_ok(out, ready_n)
+                and self._peek_ok(out, ready_n, stalled)
             )
-            aim = out if go else hide
+            if go:
+                aim = out
+            else:
+                # waiting: shift between two hidden points, so it is never standing still
+                aim = hide
+                if st.get("hide2") and ((tick // PEEK_SWAY_TICKS) + b) % 2 == 1:
+                    aim = st["hide2"]
             dx, dy = aim[0] - px, aim[1] - py
             if math.hypot(dx, dy) > 1e-3:
                 des[b] = _clip(dx / speed, dy / speed, 1.0)
