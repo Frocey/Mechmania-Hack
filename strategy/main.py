@@ -8,9 +8,10 @@ from . import *
 #
 #   Until the endgame starts
 #     * Opening: the free tick-0 bot + 16 rush orders (the 800 starting tokens) = 17 bots:
-#       8 extractors, 8 shooters, 1 healer. The extractors mine OUR deposit.
-#     * Every build after that (free or rush) replaces a lost extractor first, so there are
-#       always 8 mining; anything else is a shooter or healer at 3:1 for the defence.
+#       8 extractors, 6 shooters, 3 healers. The extractors mine OUR deposit.
+#     * Every build after that (free or rush) is a shooter or healer for the defence (2 shooters
+#       per healer) until there are FIGHTER_TARGET of them; only then are lost extractors replaced,
+#       so there are always 8 mining.
 #     * The defence holds the "gates": the narrow places the enemy has to come through to
 #       reach our half. At each gate the shooters stand where they can see the spot the
 #       enemy steps out of but the approach behind it cannot see them, so the enemy is
@@ -32,8 +33,8 @@ from . import *
 # =====================================================================================
 
 N_MINERS = 8
-N_OPENING_SHOOTERS = 8
-N_OPENING_HEALERS = 1
+N_OPENING_SHOOTERS = 6
+N_OPENING_HEALERS = 3
 OPENING = (
     [BotClass.Extractor] * N_MINERS
     + [BotClass.Battle] * N_OPENING_SHOOTERS
@@ -41,8 +42,9 @@ OPENING = (
 )
 
 # The defence (and later the payload team) is kept at this many shooters per healer, for every
-# build that joins it.
-BASE_SHOOTERS_PER_HEALER = 3
+# build that joins it: 2 shooters per healer, i.e. one healer for every two shooters. (The 17-bot
+# opening is 6 shooters and 3 healers, exactly that.)
+BASE_SHOOTERS_PER_HEALER = 2
 
 # Our half is y >= Y_LINE (in our own frame; the engine mirrors the world for the other side).
 # Bots stay Y_MARGIN below it until the endgame.
@@ -75,9 +77,14 @@ MINER_REPLAN_TICKS = 20
 MINER_MOVE_GAIN = 1.5
 MINER_SAFE_CAP = 40.0
 
-# Lost extractors are replaced (up to N_MINERS) ahead of every other build, until a replacement
-# could no longer arrive and mine for EXTRACTOR_MIN_MINE_TICKS before the swap below.
+# Lost extractors are replaced (up to N_MINERS), but only once the defence has FIGHTER_TARGET
+# shooters and healers: until then every build goes to fighters. The exception is
+# EXTRACTOR_FLOOR: with fewer extractors than that nothing would ever be earned to build fighters
+# with, so one is replaced regardless. Replacements stop once one could no longer arrive and mine
+# for EXTRACTOR_MIN_MINE_TICKS before the swap below.
 REPLACE_EXTRACTORS = True
+FIGHTER_TARGET = 16
+EXTRACTOR_FLOOR = 1
 EXTRACTOR_MIN_MINE_TICKS = 300
 
 # --- gates (choke points) --------------------------------------------------------------
@@ -108,6 +115,18 @@ PRIOR_WEIGHT = 1.0
 REBALANCE_TICKS = 45
 REBALANCE_SLACK = 2
 FLANK_POOL = 40             # how many of a gate's best spots a defender may shift between
+
+# --- rotating wounded shooters out of the line ---------------------------------------------
+# A shooter below RETREAT_FRAC of full health falls back to a spot within heal range of a healer
+# (further back than it stands, out of the enemy's sight where the map allows) and stays there
+# until it has healed to RECOVER_FRAC. The spot it left is taken by the rear-most healthy shooter
+# (any healthy shooter steps up into a free spot at least ROTATE_GAP places better than its own),
+# so the line stays full and the wounded and the healed keep trading places. A bot moves at most
+# once per ROTATE_COOLDOWN ticks, so it cannot flap back and forth.
+RETREAT_FRAC = 0.5
+RECOVER_FRAC = 0.8
+ROTATE_COOLDOWN = 40
+ROTATE_GAP = 3
 
 # --- shooters in front ---------------------------------------------------------------
 # Healers and extractors never stand closer to an enemy than our nearest shooter does. When an
@@ -245,6 +264,7 @@ class Gate:
         self.hits = 1
         self.prior = 0.0
         self.order = []           # standing spots (grid indices), best first
+        self.rank = {}            # grid index -> place in `order` (0 = the best, front-most spot)
         self.info = {}            # grid index -> (exit points seen, lane points seen)
 
 
@@ -272,6 +292,8 @@ class Plan:
         self.gates = []         # the gates of the front in use (home or payload chokes)
         self.fgrid = []         # ... and the standing spots they refer to
         self.swap_done = False
+        self.recovering = set()  # shooters that have fallen back to be healed
+        self.moved_at = {}       # shooter id -> tick of its last rotation move
         self.last_miner_plan = -10 ** 9
         self.hist = {}          # bot id -> recent (x, y, wanted_to_move) for the stuck check
         self.escape = {}        # bot id -> (x, y, until_tick) while it steers out of a jam
@@ -367,6 +389,7 @@ class Plan:
         self.gate_of = {}
         self.spot_of = {}
         self.taken = {}
+        self.recovering = set()
         self.pressure = [0.0] * len(gates)
         self.weights = [g.prior for g in gates]
         self.last_pressure = -10 ** 9
@@ -553,6 +576,7 @@ class Plan:
             rows.append((seen_exit - LANE_WEIGHT * seen_lane, -d, idx, seen_exit, seen_lane))
         rows.sort(reverse=True)
         g.order = [r[2] for r in rows]
+        g.rank = {idx: k for k, idx in enumerate(g.order)}
         g.info = {r[2]: (r[3], r[4]) for r in rows}
 
     # ---- the payload front -----------------------------------------------------------
@@ -692,6 +716,7 @@ class Plan:
             rows.append((score, -_dist(x, y, gx, gy), idx, seen))
         rows.sort(reverse=True)
         gate.order = [r[2] for r in rows]
+        gate.rank = {idx: k for k, idx in enumerate(gate.order)}
         gate.info = {r[2]: (r[3], 0) for r in rows}
         return grid, [gate]
 
@@ -852,6 +877,8 @@ class Plan:
         self.aim.pop(bid, None)
         self.hist.pop(bid, None)
         self.escape.pop(bid, None)
+        self.recovering.discard(bid)
+        self.moved_at.pop(bid, None)
         self.miner_book.drop(bid)
         self.ring_of.pop(bid, None)
         self._release(bid)
@@ -944,15 +971,20 @@ class Plan:
     def _want_extractor(self, state, conf):
         """Should the next build replace a lost extractor?
 
-        Yes while there are fewer than N_MINERS, unless a replacement could not arrive and mine
-        for EXTRACTOR_MIN_MINE_TICKS before the extractors are swapped out for fighters (see
-        SWAP_EXTRACTORS) or the endgame starts: a bot built too late to earn anything is just
-        50 tokens not spent on a fighter.
+        Yes while there are fewer than N_MINERS, but fighters come first: not until the defence
+        has FIGHTER_TARGET shooters and healers (unless there are fewer than EXTRACTOR_FLOOR
+        extractors, when there would be no income to build fighters with). And not if a
+        replacement could not arrive and mine for EXTRACTOR_MIN_MINE_TICKS before the extractors
+        are swapped out for fighters (see SWAP_EXTRACTORS): a bot built too late to earn anything
+        is just 50 tokens not spent on a fighter.
         """
         if not REPLACE_EXTRACTORS:
             return False
         miners = sum(1 for role in self.role.values() if role == ROLE_MINER)
         if miners >= N_MINERS:
+            return False
+        fighters = sum(1 for role in self.role.values() if role == ROLE_DEFENDER)
+        if fighters < FIGHTER_TARGET and miners >= EXTRACTOR_FLOOR:
             return False
         cutoff = self.push_start   # after this the extractors are swapped out / left behind
         return state.tick + self.dep_walk_ticks + EXTRACTOR_MIN_MINE_TICKS <= cutoff
@@ -1213,6 +1245,85 @@ class Plan:
                 self.gate_of[h] = gi
                 self._take_support_spot(h, gi)
 
+        self._rotate_wounded(me, tick)
+
+    def _recovery_spot(self, g, bid, healer_spots, busy):
+        """Where a wounded shooter falls back to: a free spot within heal range of a healer,
+        further back than where it stands, preferring one the approach cannot see."""
+        reach = self.conf.bot.base_heal_range - 0.5
+        here = g.rank.get(self.spot_of[bid], 0)
+        best = None
+        for idx in g.order:
+            if idx in busy or g.rank.get(idx, 10 ** 9) <= here:
+                continue
+            x, y = self.fgrid[idx]
+            d = min(_dist(x, y, hx, hy) for hx, hy in healer_spots)
+            if d > reach:
+                continue
+            key = (g.info[idx][1], d, g.rank[idx])
+            if best is None or key < best[0]:
+                best = (key, idx)
+        return best[1] if best is not None else None
+
+    def _rotate_wounded(self, me, tick):
+        """Trade wounded shooters for healthy ones so the line stays full and everyone lives longer.
+
+        1. A shooter under RETREAT_FRAC of full health drops back next to a healer.
+        2. The freed front spot is taken by the rear-most healthy shooter, and a shooter that has
+           healed to RECOVER_FRAC steps up into the best free spot again. Both are the same rule:
+           a healthy shooter moves into a free spot that is ROTATE_GAP places better than its own.
+        """
+        full = self.conf.bot.health
+        busy = self._busy()
+        for gi, g in enumerate(self.gates):
+            shooters = [
+                b for b, gj in self.gate_of.items()
+                if gj == gi and b in me and b in self.spot_of and self.cls.get(b) == BotClass.Battle
+            ]
+            healer_spots = [
+                self.fgrid[self.spot_of[b]] for b, gj in self.gate_of.items()
+                if gj == gi and b in self.spot_of and self.cls.get(b) == BotClass.Healer
+            ]
+
+            for b in shooters:
+                if b in self.recovering and me[b].health >= RECOVER_FRAC * full:
+                    self.recovering.discard(b)
+
+            # 1. the wounded fall back (at most one per gate per tick, worst first)
+            if healer_spots:
+                for b in sorted(shooters, key=lambda b: me[b].health):
+                    if me[b].health >= RETREAT_FRAC * full:
+                        break
+                    if b in self.recovering or tick - self.moved_at.get(b, -10 ** 9) < ROTATE_COOLDOWN:
+                        continue
+                    spot = self._recovery_spot(g, b, healer_spots, busy)
+                    if spot is None:
+                        continue
+                    busy.discard(self.spot_of[b])
+                    busy.add(spot)
+                    self._assign_spot(b, spot)
+                    self.recovering.add(b)
+                    self.moved_at[b] = tick
+                    break
+
+            # 2. the healthy step up into the best free spot (one per gate per tick)
+            free = next((idx for idx in g.order if idx not in busy), None)
+            if free is None:
+                continue
+            ready = [
+                b for b in shooters
+                if b not in self.recovering and me[b].health >= RETREAT_FRAC * full
+                and tick - self.moved_at.get(b, -10 ** 9) >= ROTATE_COOLDOWN
+            ]
+            if not ready:
+                continue
+            rear = max(ready, key=lambda b: g.rank.get(self.spot_of[b], 10 ** 9))
+            if g.rank.get(self.spot_of[rear], 10 ** 9) >= g.rank.get(free, 0) + ROTATE_GAP:
+                busy.discard(self.spot_of[rear])
+                busy.add(free)
+                self._assign_spot(rear, free)
+                self.moved_at[rear] = tick
+
     def _plan_miners(self, me, tick):
         """Move extractors away from enemy shooters, as far as mining allows.
 
@@ -1292,8 +1403,8 @@ class Plan:
         idx = self.spot_of.get(bid)
         if idx is None:
             return None
-        if bot.class_ == BotClass.Battle:
-            idx = self._hold_flank(bid, bot, idx)
+        if bot.class_ == BotClass.Battle and bid not in self.recovering:
+            idx = self._hold_flank(bid, bot, idx)     # (a wounded bot stays with its healer)
         return self.fgrid[idx]
 
     def _valid_ring(self, state):
