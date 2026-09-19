@@ -192,6 +192,7 @@ FAR_SPOT = 7.5               # spots further than this from the gate lose score 
 STANCE_HOME = (0.5, 0.8, LANE_WEIGHT, False, 0.0)
 STANCE_HOLD = (0.6, 0.85, LANE_WEIGHT, False, -0.2)    # winning: play it safe
 STANCE_DEFEND = (0.3, 0.6, 0.5, True, 0.3)             # losing: take more risks
+STANCE_ASSAULT = (0.4, 0.7, 0.5, True, 0.3)            # taking the payload: bold, but not reckless
 
 # --- shooters in front ---------------------------------------------------------------
 # Healers and extractors never stand closer to an enemy than our nearest shooter does. When an
@@ -284,6 +285,31 @@ NEAR_PAYLOAD_R = 16.0
 TIME_FACTOR = 1.25
 TIME_SLACK = 300
 STANCE_MIN_TICKS = 120
+# Also attack when we are losing and nothing has changed for STANDSTILL_TICKS: a standoff that
+# neither side will break is a loss for the side the payload is closer to.
+STANDSTILL_TICKS = 900
+STANDSTILL_C = 0.003
+
+# --- the assault: taking the payload back as a fighting group --------------------------------
+# Attacking is not a different game. The army keeps doing everything it does at a gate (front
+# spots that put many shooters on the same enemy, peeking on cooldown, wounded falling back to
+# the healers), around a group centre that walks towards the payload:
+#   1. it first assembles: the front spots are the ones nearest the centre, and the centre only
+#      moves on when TRANSIT_COHESION of the shooters are within TRANSIT_R of it, so the forces
+#      from the left and the right join up before anything advances;
+#   2. it advances TRANSIT_STEP each layout (every RELAYOUT_TICKS) along the walking route;
+#   3. once enemy shooters or the payload's surroundings are within range, the usual layout takes
+#      over: spots that can hit them, in one blob, peeking and retreating, closer if the odds
+#      allow (`advance`), further back if they do not;
+#   4. only when no enemy shooter is within PUSH_CLEAR of the payload do PUSHERS shooters walk up
+#      and push it; the moment one appears they rejoin the formation.
+# ASSAULT_FAR is how far from the payload the formation may stand.
+TRANSIT_R = 3.5
+TRANSIT_COHESION = 0.7
+TRANSIT_STEP = 0.5
+PUSHERS = 4
+PUSH_CLEAR = 6.0
+ASSAULT_FAR = 9.0
 # The army is one group. It is split between gates only if a second gate's claim is at least
 # SPLIT_FRACTION of the strongest gate's AND each group would have at least MIN_GROUP shooters;
 # otherwise everybody goes to the strongest gate. No lone sentries at the other gates.
@@ -398,7 +424,10 @@ class Plan:
         self._ring_tick = -1
         self._ring_cache = {}
         self._width_cache = {}
-        self.mode = "home"      # "home" (holding the gates) -> "push" <-> "hold" (at the chokes)
+        # "home" (holding the gates) -> "assault" (taking the payload as a fighting group)
+        # <-> "hold" (holding the doorways with the payload where we want it); or "defend" (losing:
+        # back at our own gates, aggressively).
+        self.mode = "home"
         self.gates = []         # the gates of the front in use (home or payload chokes)
         self.fgrid = []         # ... and the standing spots they refer to
         self.swap_done = False
@@ -408,6 +437,8 @@ class Plan:
         self.cover_since = {}    # shooter id -> tick it went into cover
         self.in_cover = set()    # shooters that are in cover this tick
         self.stance_since = 0    # tick the current late-game stance began
+        self.pushers = set()     # shooters pushing the payload (assault stance, no enemy near it)
+        self._cap_ref = (0, 0.0)  # (tick, capture) when the payload last moved, for standstills
         self._capture = 0.0
         self._enemy_healers = 0
         self._last_pos = {}
@@ -468,6 +499,10 @@ class Plan:
         self._find_hold()
         self.push_grid, self.push_gates = self._build_push_front()
 
+        # Front 3: the assault. One "gate" whose centre is wherever the payload is, over a lattice of
+        # every standing spot on the map; its spots are picked near the group and against the enemy.
+        self.assault_grid, self.assault_gates = self._build_assault_front()
+
         self._use_front(self.home_gates, self.grid)
 
         # How long a new extractor takes to walk from our spawn to a mining spot.
@@ -487,6 +522,31 @@ class Plan:
         if len(self.mine_order) < N_MINERS:
             print(f"[plan] WARNING: only {len(self.mine_order)} spots with a sightline to the deposit")
         self.ready = True
+
+    def _build_assault_front(self):
+        """The assault's spots and its single gate.
+
+        The gate has no fixed doorway: its centre is set to the payload's position every tick, it
+        has no exit points or approach lane of its own (the targets are the enemy shooters near the
+        payload and the ring around it, worked out at each layout), and any standing spot on the map
+        can be used, so the group can stand wherever the fight is. Only spots within ASSAULT_FAR of
+        the payload count as front spots.
+        """
+        grid = []
+        y = 0.5
+        while y <= self.map_max:
+            x = 0.5
+            while x <= self.map_max:
+                if self._standable(x, y):
+                    grid.append((x, y))
+                x += self.spacing
+            y += self.spacing
+        gate = Gate(16.0, 16.0, [], [])
+        gate.prior = 1.0
+        gate.grid = grid
+        gate.cands = list(range(len(grid)))
+        gate.far = ASSAULT_FAR
+        return grid, [gate]
 
     def _describe(self, label, gates, grid):
         for i, g in enumerate(gates):
@@ -1055,8 +1115,11 @@ class Plan:
 
         action = FleetAction.new()
         self._decide_build(state, conf, action)
-        if self.mode != "push":
-            self._plan_defense(me, tick)
+        if self.mode == "assault":
+            # the assault's "gate" is wherever the payload is
+            self.gates[0].cx, self.gates[0].cy = payload.x, payload.y
+        self._plan_defense(me, tick)
+        self._update_pushers(me, state, payload)
         self._plan_miners(me, tick)
         self._update_peek(me, tick)
 
@@ -1192,9 +1255,12 @@ class Plan:
         the payload and our base, and fights there aggressively instead of marching out to be
         picked off one by one. See DEFEND_ENTER and friends at the top of the file.
         """
+        c = state.capture
+        # has the payload moved lately? (a standoff is a payload that has not); tracked from the start
+        if abs(c - self._cap_ref[1]) > STANDSTILL_C:
+            self._cap_ref = (tick, c)
         if self.mode == "home" and tick < self.push_start:
             return
-        c = state.capture
         mine = sum(
             1 for b, r in self.role.items()
             if r == ROLE_DEFENDER and self.cls.get(b) == BotClass.Battle
@@ -1203,24 +1269,35 @@ class Plan:
 
         losing = c < DEFEND_EXIT if self.mode == "defend" else c <= -DEFEND_ENTER
         if losing:
-            want = "push" if self._should_attack(state, c) else "defend"
+            want = "assault" if self._should_attack(state, c) else "defend"
         else:
-            want = "push" if self.mode in ("home", "defend") else None
+            want = "assault" if self.mode in ("home", "defend") else None
 
         if self.mode == "home":
             self._enter(want, tick, c, mine, theirs)
         elif want is not None and want != self.mode and tick - self.stance_since >= STANCE_MIN_TICKS:
             self._enter(want, tick, c, mine, theirs)
 
-        # Winning or level: push to the doorways, hold there, and push again if knocked back.
-        if self.mode in ("push", "hold") and self.push_gates:
+        # Winning or level: take the payload to the doorways, hold there, and take it again if it
+        # is knocked back. (All of it as a fighting group: see the assault comment at the top.)
+        if self.mode in ("assault", "hold") and self.push_gates:
             remaining = (self.hold_capture - c) * self.path_len
-            if self.mode == "push" and remaining <= PUSH_LEAD_ARC:
-                self.mode = "hold"
-                print(f"[plan] tick {tick}: payload at the chokes (capture {c:.3f}) -- holding")
+            if self.mode == "assault" and c >= 0 and remaining <= PUSH_LEAD_ARC:
+                self._enter("hold", tick, c, mine, theirs)
             elif self.mode == "hold" and remaining >= REPUSH_ARC:
-                self.mode = "push"
-                print(f"[plan] tick {tick}: payload knocked back (capture {c:.3f}) -- pushing")
+                self._enter("assault", tick, c, mine, theirs)
+
+    def _start_assault(self):
+        """Begin an assault: the group's centre starts where the army is (the average of its bots),
+        so it forms up around itself and then walks."""
+        g = self.assault_gates[0]
+        pts = [self._last_pos[b] for b, r in self.role.items()
+               if r == ROLE_DEFENDER and b in self._last_pos]
+        if pts:
+            g.focus = (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+        g.order, g.rank, g.quality = [], {}, set()
+        g.sig = None
+        g.last_layout = -10 ** 9
 
     def _should_attack(self, state, c):
         """We are losing the payload (it is on our side). Should we go and take it back?
@@ -1235,6 +1312,9 @@ class Plan:
         )
         their_force = len(self._threat_pts) + 0.5 * self._enemy_healers
         if not self._threat_pts:
+            return True
+        # a standoff: the payload has not moved for a long time and it is on our side
+        if state.tick - self._cap_ref[0] >= STANDSTILL_TICKS:
             return True
 
         # time: can we still afford to wait? (ticks to push the payload back to centre, plus the
@@ -1256,22 +1336,33 @@ class Plan:
             return True
 
         # odds: overall, and around the payload
-        ratio = AGGR_KEEP if self.mode == "push" else AGGR_OUTNUMBER
+        ratio = AGGR_KEEP if self.mode == "assault" else AGGR_OUTNUMBER
         if my_force >= ratio * their_force:
             return True
         near = sum(1 for _, ex, ey in self._threat_pts if _dist(ex, ey, p.x, p.y) <= NEAR_PAYLOAD_R)
         return my_force >= AGGR_NEAR * max(1, near)
 
+    def _front_of(self, mode):
+        """The (gates, standing spots) a stance fights on."""
+        if mode in ("home", "defend"):
+            return self.home_gates, self.grid
+        if mode == "assault":
+            return self.assault_gates, self.assault_grid
+        return self.push_gates, self.push_grid           # "hold"
+
     def _enter(self, new, tick, c, mine, theirs):
-        """Switch stance, moving the team onto the right front (our gates, or the payload's)."""
+        """Switch stance, moving the team onto the right front (our gates, the assault's, or the
+        payload doorways')."""
         old = self.mode
         self.mode = new
         self.stance_since = tick
-        if new == "defend":
-            self._use_front(self.home_gates, self.grid)
-        elif old in ("home", "defend"):
-            self._use_front(self.push_gates, self.push_grid)
+        gates, grid = self._front_of(new)
+        if gates is not self.gates:
+            self._use_front(gates, grid)
             self.ring_of = {}
+            self.pushers = set()
+            if new == "assault":
+                self._start_assault()
         print(
             f"[plan] tick {tick}: {old} -> {new} (capture {c:.3f}, our shooters {mine} "
             f"vs their {theirs})"
@@ -1633,6 +1724,8 @@ class Plan:
         """(retreat fraction, recover fraction, lane weight, aggressive) for the current stance."""
         if self.mode == "defend":
             return STANCE_DEFEND
+        if self.mode == "assault":
+            return STANCE_ASSAULT
         if self.mode == "hold":
             return STANCE_HOLD
         return STANCE_HOME
@@ -1650,6 +1743,8 @@ class Plan:
         must be able to hit the moment they peek. Aggressive: also the ones still in the approach
         within DYN_RANGE/2, so the group starts trading earlier."""
         g = self.gates[gi]
+        if self.mode == "assault":
+            return self._assault_targets(g)
         out = []
         for _, ex, ey in self._threat_pts:
             nearest = min(range(len(self.gates)),
@@ -1662,6 +1757,67 @@ class Plan:
                 out.append((_dist(ex, ey, g.cx, g.cy), ex, ey))
         out.sort()
         return [(ex, ey, DYN_WEIGHT) for _, ex, ey in out[:DYN_MAX_ENEMIES]]
+
+    def _assault_targets(self, g):
+        """What an assault's spots should be able to hit: the enemy shooters near the payload
+        (out to twice the formation range, nearest first) and the ring around the payload where
+        the enemy stands to push it. The ring points count for less than a shooter."""
+        px, py = g.cx, g.cy
+        near = sorted(
+            (_dist(ex, ey, px, py), ex, ey) for _, ex, ey in self._threat_pts
+            if _dist(ex, ey, px, py) <= 2.0 * ASSAULT_FAR
+        )
+        out = [(ex, ey, DYN_WEIGHT) for _, ex, ey in near[:DYN_MAX_ENEMIES]]
+        for k in range(8):
+            a = 2.0 * math.pi * k / 8.0
+            rx, ry = px + 1.8 * math.cos(a), py + 1.8 * math.sin(a)
+            if self._standable(rx, ry):
+                out.append((rx, ry, 1.0))
+        return out
+
+    def _transit(self, g, me, healthy, busy):
+        """Nothing in range to hit yet: keep the group together and walk it towards the payload.
+
+        The front is simply the spots nearest the group's centre, so it stays one blob while it
+        walks. The centre steps TRANSIT_STEP along the walking route to the payload, but only when
+        TRANSIT_COHESION of the shooters are within TRANSIT_R of it: the forces from the left and
+        the right join up first, and nobody is left behind.
+        """
+        fx, fy = g.focus
+        pts = [(me[b].pos.x, me[b].pos.y) for b in healthy]
+        near = sum(1 for x, y in pts if _dist(x, y, fx, fy) <= TRANSIT_R)
+        if pts and near >= TRANSIT_COHESION * len(pts):
+            v = navigate_to(Vec2(fx, fy), Vec2(g.cx, g.cy))
+            n = math.hypot(v.x, v.y)
+            if n > 1e-6:
+                step = min(TRANSIT_STEP, _dist(fx, fy, g.cx, g.cy))
+                g.focus = (fx + v.x / n * step, fy + v.y / n * step)
+                fx, fy = g.focus
+        ranked = sorted(
+            (_dist(g.grid[i][0], g.grid[i][1], fx, fy), i) for i in g.cands
+            if i not in busy and _dist(g.grid[i][0], g.grid[i][1], fx, fy) <= ROI_R
+        )
+        # The nearest spots, but on our side of any wall: a spot just across a thin wall from the
+        # centre would split the blob, so each needs a clear line to the centre (relaxed only if that
+        # leaves fewer than half the spots we need).
+        here = Vec2(fx, fy)
+        front, blocked = [], []
+        for _, i in ranked:
+            self._static(g, i)
+            if g.hug[i]:
+                continue
+            if line_of_sight(here, Vec2(g.grid[i][0], g.grid[i][1])):
+                front.append(i)
+            else:
+                blocked.append(i)
+            if len(front) >= len(healthy):
+                break
+        if len(front) < len(healthy) // 2:
+            front += blocked[:len(healthy) - len(front)]
+        picked = set(front)
+        g.order = front + [i for i in g.order if i not in picked]
+        g.rank = {idx: k for k, idx in enumerate(g.order)}
+        g.quality = picked
 
     def _reserve_spot(self, g, front_set, healer_pts, reach):
         """A spot behind the front for a wounded (or surplus) shooter: not a front spot, free,
@@ -1720,7 +1876,8 @@ class Plan:
                 _dist(ex, ey, g.cx, g.cy) <= DYN_RANGE for _, ex, ey in self._threat_pts
             )
             age = tick - g.last_layout
-            if sig == g.sig and not (enemy_near and age >= RELAYOUT_TICKS):
+            # an assault re-lays out every cycle: the payload and the enemy are what it is aimed at
+            if sig == g.sig and not ((enemy_near or self.mode == "assault") and age >= RELAYOUT_TICKS):
                 continue
             if sig != g.sig and age < 5:
                 continue
@@ -1766,6 +1923,8 @@ class Plan:
         sticky = {self.spot_of[b] for b in healthy if b in self.spot_of}
         self._rescore(g, self._dynamic_targets(gi, aggressive), lane_w,
                       n_front=len(healthy), sticky=sticky, advance=advance, avoid=busy)
+        if self.mode == "assault" and not g.quality and healthy:
+            self._transit(g, me, healthy, busy)      # nothing in range yet: assemble and walk
         front = [i for i in g.order if i in g.quality and i not in busy][:len(healthy)]
         front_set = set(front)
 
@@ -1869,8 +2028,6 @@ class Plan:
         gate's shooters are ready too (or it has waited SYNC_MAX_WAIT ticks), so they go together.
         """
         self.in_cover = set()
-        if self.mode == "push":
-            return
         speed = self.conf.bot.speed
         rng = self.conf.bot.blaster_range
         for gi, g in enumerate(self.gates):
@@ -1984,8 +2141,9 @@ class Plan:
         if role == ROLE_MINER:
             idx = self.miner_book.assign(bid, self.mine_order)
             return self.grid[idx] if idx is not None else None
-        # Defenders: pushing the payload, or standing at their gate.
-        if self.mode == "push":
+        # Defenders: pushing the payload (only in an assault, and only while no enemy shooter is
+        # near it), or standing on their spot in the formation.
+        if bid in self.pushers:
             return self._payload_target(bid, bot, state)
         idx = self.spot_of.get(bid)
         if idx is None:
@@ -1996,28 +2154,50 @@ class Plan:
             idx = self._hold_flank(bid, bot, idx)     # (a wounded bot stays with its healer)
         return self.fgrid[idx]
 
+    def _update_pushers(self, me, state, payload):
+        """In an assault, pick the shooters that push the payload: only while it is safe to.
+
+        Pushing means standing within the payload's capture radius, which is exactly where the
+        enemy shoots. So: none while an enemy shooter is within PUSH_CLEAR of the payload (the
+        formation deals with them first), and none until the group is close (half the shooters
+        within 12 units). Then the PUSHERS healthy shooters nearest the payload go and push, and
+        rejoin the formation the moment an enemy shooter appears.
+        """
+        if self.mode != "assault":
+            self.pushers = set()
+            return
+        threat_near = any(
+            _dist(ex, ey, payload.x, payload.y) <= PUSH_CLEAR for _, ex, ey in self._threat_pts
+        )
+        healthy = [b for b, gj in self.gate_of.items()
+                   if b in me and self.cls.get(b) == BotClass.Battle and b not in self.recovering]
+        if threat_near or not healthy:
+            self.pushers = set()
+            return
+        dist = {b: _dist(me[b].pos.x, me[b].pos.y, payload.x, payload.y) for b in healthy}
+        if sum(1 for d in dist.values() if d <= 12.0) < len(healthy) / 2.0:
+            self.pushers = set()
+            return
+        keep = [b for b in self.pushers if b in dist]
+        rest = sorted((b for b in healthy if b not in keep), key=lambda b: dist[b])
+        self.pushers = set((keep + rest)[:PUSHERS])
+
     def _stay_together(self, me, targets, state):
-        """The army arrives as a group, not as a trickle, whether it is marching to the payload or
+        """The army arrives as a group, not as a trickle, whether it is advancing on the payload or
         relocating to another gate.
 
-        Each group (the whole army when marching; the men at one gate otherwise) has a reference
-        point: the payload, or the gate's focus. A bot that is still far from it (over 6 units) but
+        Each group (the men at one gate, or the whole army in an assault) has a reference
+        point: the gate's focus, the centre of the group. A bot that is still far from it (over 6 units) but
         more than MARCH_SPREAD nearer than the group's median waits where it is until the rest close
         up, unless an enemy shooter is close and it is fighting anyway. Bots already at the point,
         and late arrivals coming up behind, are unaffected.
         """
         groups = []
-        if self.mode == "push":
-            p = state.payload_pos()
-            ids = [b for b, r in self.role.items()
-                   if r == ROLE_DEFENDER and b in me and targets.get(b) is not None]
-            groups.append(((p.x, p.y), ids))
-        else:
-            for gi, g in enumerate(self.gates):
-                ids = [b for b, gj in self.gate_of.items()
-                       if gj == gi and b in me and targets.get(b) is not None
-                       and b not in self.recovering]
-                groups.append((g.focus, ids))
+        for gi, g in enumerate(self.gates):
+            ids = [b for b, gj in self.gate_of.items()
+                   if gj == gi and b in me and targets.get(b) is not None
+                   and b not in self.recovering and b not in self.pushers]
+            groups.append((g.focus, ids))
 
         near = self.conf.bot.blaster_range + 4.0
         for ref, ids in groups:
