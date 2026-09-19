@@ -20,13 +20,13 @@ from . import *
 #       our half).
 #   Around the time a full fleet turns its extractors into fighters (see SWAP_EXTRACTORS; nothing
 #   can be built once the endgame starts), the whole team leaves home for the payload:
-#     * It escorts the payload forward, shooters in front, but only as far as the two choke
-#       points nearest it (PAYLOAD_CHOKES: the doorways the enemy has to come through to reach
-#       the payload). Then it stops pushing and holds: two firing lines, one facing each choke,
-#       shooters where they can hit the spot the enemy steps out of and healers behind them.
+#     * It escorts the payload forward, shooters in front, but only as far as the two doorways
+#       the enemy has to come through to reach it (HOLD_KILL). Then it stops pushing and holds
+#       ONE formation that follows HOLD_LINE, an L along the wall that can see both doorways:
+#       shooters on the line, healers behind them. Nobody leaves the formation to chase.
 #     * That position is held to the end of the match: the payload sits on the enemy's side of
-#       centre, so it wins on timeout, or the enemy dies feeding into the chokes. If the payload
-#       is ever pushed back, the team goes back to pushing it.
+#       centre, so it wins on timeout, or the enemy dies feeding into the doorways. If the
+#       payload is ever pushed back, the team goes back to pushing it.
 #
 #   Always: no two of our bots may sit inside one blaster splash of each other.
 # =====================================================================================
@@ -136,18 +136,26 @@ SWAP_LEAD_TICKS = 150
 WALK_SLACK = 40
 
 # --- the payload push and hold --------------------------------------------------------
-# The two chokes to hold, in OUR frame (the engine mirrors the world for the other side, so
-# these are right whichever side we spawn on): (25, 15) is the doorway east of the payload's
-# corner and (22, 13) the one north of it.
-PAYLOAD_CHOKES = [(25.0, 15.0), (22.0, 13.0)]
-# The payload is pushed to the point on its path that is nearest to both chokes (found from the
-# map at start-up), then let go: pushing stops once everyone is more than the capture radius
-# away. The team starts standing off when the payload is PUSH_LEAD_ARC short of that point (it
-# takes a moment to walk out of the capture radius and the payload keeps rolling meanwhile), and
-# goes back to pushing if it is knocked back by REPUSH_ARC or more.
+# All in OUR frame (the engine mirrors the world for the other side, so these are right
+# whichever side we spawn on).
+#
+# HOLD_KILL: the two doorways to hold, each as a line the enemy has to cross: the mouth of the
+# doorway north of the payload's corner (y = 13.8, x from 21.6 to 24.5) and the doorway east of
+# it (x = 25.6, y from 15 to 16.8). The firing formation is picked to see both.
+HOLD_KILL = [((21.6, 13.8), (24.5, 13.8)), ((25.6, 15.0), (25.6, 16.8))]
+# HOLD_LINE: where the team stands, an L: down the west side then along the south wall. Shooters
+# fill the line (and, if there are more of them, the rows just in front of it that are still
+# clear of the payload); healers stand behind them.
+HOLD_LINE = [(18.4, 14.5), (18.4, 17.5), (24.5, 17.5)]
+HOLD_BAND = 2.2             # standing spots are searched this close to HOLD_LINE
+# The payload is pushed until it is HOLD_CLEAR from every spot on HOLD_LINE (just over its
+# 2.5 capture radius), at which point nobody in the formation can push it any further. The team
+# starts standing off when it is PUSH_LEAD_ARC short of that (it takes a moment to walk out of
+# the capture radius and the payload keeps rolling meanwhile), and goes back to pushing if it is
+# knocked back by REPUSH_ARC or more.
 PUSH_LEAD_ARC = 0.8
 REPUSH_ARC = 2.0
-HOLD_CLEAR = 2.7            # firing lines stay this far from the payload (capture radius + margin)
+HOLD_CLEAR = 2.65
 # Start the march this many ticks before the swap below would begin (0 = together with it).
 PUSH_EARLY_TICKS = 0
 
@@ -314,7 +322,7 @@ class Plan:
         self.ring_offsets = self._ring_offsets()
 
         self._describe("home gate", self.home_gates, self.grid)
-        self._describe("payload choke", self.push_gates, self.push_grid)
+        self._describe("payload formation", self.push_gates, self.push_grid)
         print(
             f"[plan] our deposit at ({self.dep_x:.1f}, {self.dep_y:.1f}); "
             f"{len(self.mine_order)} mining spots, {len(self.grid)} standing spots in our half; "
@@ -531,82 +539,133 @@ class Plan:
 
     # ---- the payload front -----------------------------------------------------------
 
-    def _find_hold(self):
-        """Where on its path to leave the payload: the point nearest to both chokes.
+    @staticmethod
+    def _sample_polyline(pts, step):
+        """Points along a polyline, `step` apart (the last one included)."""
+        out = [pts[0]]
+        carry = 0.0
+        for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+            length = _dist(x0, y0, x1, y1)
+            pos = step - carry
+            while pos <= length + 1e-9:
+                t = pos / length if length > 0 else 0.0
+                out.append((x0 + (x1 - x0) * t, y0 + (y1 - y0) * t))
+                pos += step
+            carry = length - (pos - step)
+        if _dist(out[-1][0], out[-1][1], pts[-1][0], pts[-1][1]) > 0.3:
+            out.append(pts[-1])
+        return out
 
-        Minimises the larger of the distances to the chokes, so it sits between them.
+    @staticmethod
+    def _poly_dist(x, y, pts):
+        """Distance from (x, y) to a polyline."""
+        best = 1e9
+        for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+            dx, dy = bx - ax, by - ay
+            n2 = dx * dx + dy * dy
+            t = 0.0 if n2 <= 0 else max(0.0, min(1.0, ((x - ax) * dx + (y - ay) * dy) / n2))
+            best = min(best, _dist(x, y, ax + dx * t, ay + dy * t))
+        return best
+
+    def _on_our_side(self, x, y, margin):
+        """Is (x, y) on our side of both doorways (the same side as the formation)?"""
+        for ax, ay, nx, ny in self.kill_sides:
+            if nx * (x - ax) + ny * (y - ay) < margin:
+                return False
+        return True
+
+    def _find_hold(self):
+        """Work out the payload front from the drawn geometry.
+
+        The doorways (HOLD_KILL) become rows of points the enemy must cross; HOLD_LINE becomes a
+        row of standing points; and the payload is to be pushed to the first point on its path
+        that is HOLD_CLEAR from all of them, so that everyone in the formation is just outside
+        its capture radius and it stops rolling by itself.
         """
-        self.chokes = [c for c in PAYLOAD_CHOKES if self._standable(c[0], c[1])]
+        self.kill_pts = []
+        self.kill_sides = []
+        line_pts = self._sample_polyline(HOLD_LINE, self.spacing)
+        cx = sum(p[0] for p in line_pts) / len(line_pts)
+        cy = sum(p[1] for p in line_pts) / len(line_pts)
+        for (ax, ay), (bx, by) in HOLD_KILL:
+            n = max(1, int(_dist(ax, ay, bx, by) / 0.5))
+            for k in range(n + 1):
+                t = k / n
+                self.kill_pts.append((ax + (bx - ax) * t, ay + (by - ay) * t))
+            length = _dist(ax, ay, bx, by)
+            nx, ny = -(by - ay) / length, (bx - ax) / length
+            if nx * (cx - ax) + ny * (cy - ay) < 0:      # point the normal at the formation
+                nx, ny = -nx, -ny
+            self.kill_sides.append((ax, ay, nx, ny))
+
         pts = [self.conf.payload_path[i] for i in range(PAYLOAD_PATH_LEN)]
         self.path_len = sum(
             _dist(pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y) for i in range(len(pts) - 1)
         )
+
         best = None
+        fallback = None
         for step in range(0, 251):
             t = step * 0.002
             p = payload_pos(t)
-            if self.chokes:
-                worst = max(_dist(p.x, p.y, cx, cy) for cx, cy in self.chokes)
-            else:
-                worst = abs(t - 0.15)
-            if best is None or worst < best[0]:
-                best = (worst, t, p.x, p.y)
-        _, self.hold_capture, hx, hy = best
+            clear = min(_dist(p.x, p.y, x, y) for x, y in line_pts)
+            if fallback is None or clear > fallback[0]:
+                fallback = (clear, t, p.x, p.y)
+            if clear >= HOLD_CLEAR:
+                best = (clear, t, p.x, p.y)
+                break
+        _, self.hold_capture, hx, hy = best or fallback
         self.hold_pos = (hx, hy)
         self.hold_solid = (Vec2(hx, hy), self.conf.payload.radius)
 
-    def _our_side(self, x, y):
-        """Is (x, y) on our side of the chokes: can it reach our spawn without passing one?"""
-        route = self._polyline(Vec2(x, y), Vec2(self.spawn[0], self.spawn[1]))
-        if not route:
-            return False
-        return all(
-            _dist(px, py, cx, cy) > 1.5 for px, py in route for cx, cy in self.chokes
-        )
-
-    def _push_gate(self, cx, cy):
-        """A choke as a Gate: the enemy's approach to it, and the way on towards the payload."""
-        lane = []
-        route = self._polyline(
-            Vec2(self.enemy_spawn[0], self.enemy_spawn[1]), Vec2(cx, cy)
-        )
-        if route:
-            lane = route[max(0, len(route) - 1 - GATE_LANE):-1]
-        exit_pts = [(cx, cy)]
-        hx, hy = self.hold_pos
-        for ax, ay in ((hx - 4.0, hy + 1.2), (hx - 3.0, hy + 2.0), (hx - 2.0, hy + 2.5)):
-            if self._standable(ax, ay):
-                onward = self._polyline(Vec2(cx, cy), Vec2(ax, ay))
-                if onward:
-                    exit_pts = onward[:GATE_EXIT]
-                break
-        return Gate(cx, cy, lane, exit_pts)
-
     def _build_push_front(self):
-        """The standing spots and gates for holding the payload chokes."""
-        if not self.chokes:
-            print("[plan] WARNING: no usable PAYLOAD_CHOKES; the team will just keep escorting")
-            return [], []
+        """The formation: one Gate whose spots are ranked for holding both doorways.
+
+        Candidates are the standing spots within HOLD_BAND of HOLD_LINE that are on our side of
+        the doorways and outside the payload's capture radius. Each is ranked by how many points
+        of the doorways it can hit (with the payload in the way, as it will be) minus twice its
+        distance from the line, so the line itself fills first, best-placed spots first.
+        """
         hx, hy = self.hold_pos
         grid = []
         y = 0.5
         while y <= self.map_max:
             x = 0.5
             while x <= self.map_max:
-                near = any(
-                    GATE_SPOT_MIN <= _dist(x, y, cx, cy) <= GATE_SPOT_MAX for cx, cy in self.chokes
-                )
-                if (near and _dist(x, y, hx, hy) >= HOLD_CLEAR and self._standable(x, y)
-                        and self._our_side(x, y)):
+                if (self._poly_dist(x, y, HOLD_LINE) <= HOLD_BAND
+                        and _dist(x, y, hx, hy) >= HOLD_CLEAR
+                        and self._on_our_side(x, y, 0.3)
+                        and self._standable(x, y) and self._reachable(x, y)):
                     grid.append((x, y))
                 x += self.spacing
             y += self.spacing
 
-        gates = [self._push_gate(cx, cy) for cx, cy in self.chokes]
-        for g in gates:
-            g.prior = 1.0 / len(gates)
-            self._score_gate(g, grid, set(), self.hold_solid)
-        return grid, gates
+        gx = sum(p[0] for p in self.kill_pts) / len(self.kill_pts)
+        gy = sum(p[1] for p in self.kill_pts) / len(self.kill_pts)
+        gate = Gate(gx, gy, [], list(self.kill_pts))
+        gate.prior = 1.0
+
+        rng = self.conf.bot.blaster_range
+        solid_c, solid_r = self.hold_solid
+        rows = []
+        for idx, (x, y) in enumerate(grid):
+            here = Vec2(x, y)
+            seen = 0
+            for kx, ky in self.kill_pts:
+                if _dist(x, y, kx, ky) > rng - 1.0:
+                    continue
+                target = Vec2(kx, ky)
+                if not line_of_sight(here, target):
+                    continue
+                if point_seg_dist(solid_c, here, target) < solid_r:
+                    continue
+                seen += 1
+            rows.append((seen - 2.0 * self._poly_dist(x, y, HOLD_LINE),
+                         -_dist(x, y, gx, gy), idx, seen))
+        rows.sort(reverse=True)
+        gate.order = [r[2] for r in rows]
+        gate.info = {r[2]: (r[3], 0) for r in rows}
+        return grid, [gate]
 
     # ---- extractor spots -------------------------------------------------------------
 
@@ -1148,6 +1207,9 @@ class Plan:
         for idx, (ox, oy, k) in enumerate(self.ring_offsets):
             x, y = p.x + ox, p.y + oy
             if not self._standable(x, y):
+                continue
+            # Never escort from the enemy's side of the doorways.
+            if self.mode != "home" and not self._on_our_side(x, y, 0.5):
                 continue
             if not line_of_sight(pvec, Vec2(x, y)):
                 continue
