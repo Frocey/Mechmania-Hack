@@ -63,8 +63,17 @@ ALWAYS_SPREAD = False
 
 # --- extractors ----------------------------------------------------------------------
 # Mining spots are searched within this distance of the deposit centre (the engine's own
-# extract range is 5 from the bot centre to the deposit's hull; stay comfortably inside it).
-MINER_MAX_DIST = 4.2
+# extract range is 5 from the bot centre to the deposit's hull, i.e. 5.5 from its centre; stay
+# a little inside it). Every such spot with a clear line to the deposit can mine.
+MINER_MAX_DIST = 5.0
+# Extractors keep as far from enemy shooters as they can while still mining. Every
+# MINER_REPLAN_TICKS ticks, starting with the most endangered, each extractor moves to the free
+# mining spot furthest from the nearest enemy shooter, but only if that spot is at least
+# MINER_MOVE_GAIN further away than where it stands (so it does not shuffle for nothing).
+# With no enemy shooter on the field they stay where they are.
+MINER_REPLAN_TICKS = 20
+MINER_MOVE_GAIN = 1.5
+MINER_SAFE_CAP = 40.0
 
 # Lost extractors are replaced (up to N_MINERS) ahead of every other build, until a replacement
 # could no longer arrive and mine for EXTRACTOR_MIN_MINE_TICKS before the swap below.
@@ -147,7 +156,15 @@ HOLD_KILL = [((21.6, 13.8), (24.5, 13.8)), ((25.6, 15.0), (25.6, 16.8))]
 # fill the line (and, if there are more of them, the rows just in front of it that are still
 # clear of the payload); healers stand behind them.
 HOLD_LINE = [(18.4, 14.5), (18.4, 17.5), (24.5, 17.5)]
-HOLD_BAND = 2.2             # standing spots are searched this close to HOLD_LINE
+HOLD_BAND = 3.0             # standing spots are searched this close to HOLD_LINE
+# The formation is packed tighter than the rest of the plan so that more bots fit on the line:
+# spots are HOLD_SPACING apart (a little inside one blaster splash of each other, on purpose),
+# and once the main spots are full a second lattice halfway between them takes the overflow.
+# While the team is holding, moving bots only keep HOLD_HARD apart (HOLD_REP is where they start
+# to back off), so they can settle at that spacing without shoving each other out of place.
+HOLD_SPACING = 0.8
+HOLD_HARD = 0.55
+HOLD_REP = 0.7
 # The payload is pushed until it is HOLD_CLEAR from every spot on HOLD_LINE (just over its
 # 2.5 capture radius), at which point nobody in the formation can push it any further. The team
 # starts standing off when it is PUSH_LEAD_ARC short of that (it takes a moment to walk out of
@@ -255,6 +272,7 @@ class Plan:
         self.gates = []         # the gates of the front in use (home or payload chokes)
         self.fgrid = []         # ... and the standing spots they refer to
         self.swap_done = False
+        self.last_miner_plan = -10 ** 9
         self.hist = {}          # bot id -> recent (x, y, wanted_to_move) for the stuck check
         self.escape = {}        # bot id -> (x, y, until_tick) while it steers out of a jam
 
@@ -585,6 +603,7 @@ class Plan:
         self.kill_pts = []
         self.kill_sides = []
         line_pts = self._sample_polyline(HOLD_LINE, self.spacing)
+        self.line_fine = self._sample_polyline(HOLD_LINE, 0.4)
         cx = sum(p[0] for p in line_pts) / len(line_pts)
         cy = sum(p[1] for p in line_pts) / len(line_pts)
         for (ax, ay), (bx, by) in HOLD_KILL:
@@ -628,17 +647,24 @@ class Plan:
         """
         hx, hy = self.hold_pos
         grid = []
-        y = 0.5
-        while y <= self.map_max:
-            x = 0.5
-            while x <= self.map_max:
-                if (self._poly_dist(x, y, HOLD_LINE) <= HOLD_BAND
-                        and _dist(x, y, hx, hy) >= HOLD_CLEAR
-                        and self._on_our_side(x, y, 0.3)
-                        and self._standable(x, y) and self._reachable(x, y)):
-                    grid.append((x, y))
-                x += self.spacing
-            y += self.spacing
+        overflow = set()         # indices of the interleaved second lattice
+        half = HOLD_SPACING / 2.0
+        for offset, second in ((0.5, False), (0.5 + half, True)):
+            y = offset
+            while y <= self.map_max:
+                x = offset
+                while x <= self.map_max:
+                    if (self._poly_dist(x, y, HOLD_LINE) <= HOLD_BAND
+                            and _dist(x, y, hx, hy) >= HOLD_CLEAR
+                            and self._on_our_side(x, y, 0.3)
+                            and self._standable(x, y)
+                            and self._on_line_side(x, y)
+                            and self._reachable(x, y)):
+                        if second:
+                            overflow.add(len(grid))
+                        grid.append((x, y))
+                    x += HOLD_SPACING
+                y += HOLD_SPACING
 
         gx = sum(p[0] for p in self.kill_pts) / len(self.kill_pts)
         gy = sum(p[1] for p in self.kill_pts) / len(self.kill_pts)
@@ -660,12 +686,23 @@ class Plan:
                 if point_seg_dist(solid_c, here, target) < solid_r:
                     continue
                 seen += 1
-            rows.append((seen - 2.0 * self._poly_dist(x, y, HOLD_LINE),
-                         -_dist(x, y, gx, gy), idx, seen))
+            # The overflow lattice sits close to its neighbours, so it only fills once the
+            # main spots around it are gone.
+            score = seen - 2.0 * self._poly_dist(x, y, HOLD_LINE) - (2.0 if idx in overflow else 0.0)
+            rows.append((score, -_dist(x, y, gx, gy), idx, seen))
         rows.sort(reverse=True)
         gate.order = [r[2] for r in rows]
         gate.info = {r[2]: (r[3], 0) for r in rows}
         return grid, [gate]
+
+    def _on_line_side(self, x, y):
+        """Is (x, y) in the same space as the formation line: not on the far side of a wall?
+
+        A spot must see the nearest point of HOLD_LINE. This is what keeps the bottom arm's
+        neighbours out of the room on the other side of the wall it runs along.
+        """
+        nearest = min(self.line_fine, key=lambda p: _dist(x, y, p[0], p[1]))
+        return line_of_sight(Vec2(x, y), Vec2(nearest[0], nearest[1]))
 
     # ---- extractor spots -------------------------------------------------------------
 
@@ -737,6 +774,7 @@ class Plan:
         self._decide_build(state, conf, action)
         if self.mode != "push":
             self._plan_defense(me, tick)
+        self._plan_miners(me, tick)
 
         # 1. where does each bot want to go
         targets = {}
@@ -1023,20 +1061,36 @@ class Plan:
             self.pressure[gi] = 0.8 * self.pressure[gi] + 0.2 * raw[gi]
             self.weights[gi] = PRIOR_WEIGHT * self.gates[gi].prior + self.pressure[gi]
 
+    def _busy(self):
+        """Standing spots that are not free: defenders' spots, plus (while the defenders are on
+        the home grid) the extractors', which use the same grid."""
+        busy = set(self.taken)
+        if self.fgrid is self.grid:
+            busy |= set(self.miner_book.of.values())
+        return busy
+
     def _take_spot(self, bid, gi):
         """Give a defender the best free standing spot at gate gi (or, failing that, anywhere)."""
+        busy = self._busy()
         for idx in self.gates[gi].order:
-            if idx not in self.taken:
+            if idx not in busy:
                 self._assign_spot(bid, idx)
                 return idx
         for other in sorted(range(len(self.gates)), key=lambda i: -self.weights[i]):
             for idx in self.gates[other].order:
-                if idx not in self.taken:
+                if idx not in busy:
                     self._assign_spot(bid, idx)
                     return idx
-        if self.gates[gi].order:
-            self._assign_spot(bid, self.gates[gi].order[0])   # out of spots: double up
-            return self.gates[gi].order[0]
+        # Out of free spots. Share one, but the least crowded, so leftovers spread out instead of
+        # all piling onto the single best spot (which is what stacked every late healer).
+        order = self.gates[gi].order
+        if order:
+            crowd = {}
+            for i in self.spot_of.values():
+                crowd[i] = crowd.get(i, 0) + 1
+            idx = min(order, key=lambda i: crowd.get(i, 0))
+            self._assign_spot(bid, idx)
+            return idx
         return None
 
     def _take_support_spot(self, bid, gi):
@@ -1053,10 +1107,11 @@ class Plan:
         my = sum(p[1] for p in mates) / len(mates)
         mean_d = sum(_dist(p[0], p[1], g.cx, g.cy) for p in mates) / len(mates)
         reach = self.conf.bot.base_heal_range - 0.4
+        busy = self._busy()
         for level in (0, 1, 2):
             best = None
             for idx in g.order:
-                if idx in self.taken:
+                if idx in busy:
                     continue
                 x, y = self.fgrid[idx]
                 if level == 0 and g.info[idx][1] > 0:
@@ -1158,6 +1213,49 @@ class Plan:
                 self.gate_of[h] = gi
                 self._take_support_spot(h, gi)
 
+    def _plan_miners(self, me, tick):
+        """Move extractors away from enemy shooters, as far as mining allows.
+
+        Every mining spot in the pool can mine (a clear line to the deposit, within range), so the
+        only question is which is furthest from the nearest enemy shooter. Each extractor,
+        most endangered first, takes a free spot that beats its own by MINER_MOVE_GAIN or more.
+        """
+        if not self._threat_pts or tick - self.last_miner_plan < MINER_REPLAN_TICKS:
+            return
+        self.last_miner_plan = tick
+
+        miners = [b for b in sorted(self.role) if self.role[b] == ROLE_MINER
+                  and b in me and b in self.miner_book.of]
+        if not miners:
+            return
+
+        safety = {}
+
+        def safe(idx):
+            s = safety.get(idx)
+            if s is None:
+                x, y = self.grid[idx]
+                s = min(MINER_SAFE_CAP, min(_dist(x, y, ex, ey) for _, ex, ey in self._threat_pts))
+                safety[idx] = s
+            return s
+
+        used = set(self.miner_book.of.values())
+        if self.fgrid is self.grid:
+            used |= set(self.taken)      # defenders are on the home grid too: keep off their spots
+        for _, b in sorted((safe(self.miner_book.of[b]), b) for b in miners):
+            old = self.miner_book.of[b]
+            best = None
+            for idx in self.mine_order:
+                if idx in used:
+                    continue
+                s = safe(idx)
+                if s >= safe(old) + MINER_MOVE_GAIN and (best is None or s > best[0]):
+                    best = (s, idx)
+            if best is not None:
+                used.discard(old)
+                used.add(best[1])
+                self.miner_book.of[b] = best[1]
+
     def _hold_flank(self, bid, bot, idx):
         """A defender settled on its spot that cannot hit anything it can see (a deposit or the
         payload is in the way) shifts to another spot at its gate that can."""
@@ -1173,7 +1271,7 @@ class Plan:
         cands = [
             (i, self.fgrid[i][0], self.fgrid[i][1], 0) for i in self.gates[gi].order[:FLANK_POOL]
         ]
-        new = self._pick_flank(bot, cands, set(self.taken), seen)
+        new = self._pick_flank(bot, cands, self._busy(), seen)
         if new is None:
             return idx
         self._assign_spot(bid, new)
@@ -1404,6 +1502,12 @@ class Plan:
     def _spread(self, me, des, conf):
         speed = conf.bot.speed
         ids = list(me)
+        # While holding at the doorways the formation is deliberately packed (HOLD_SPACING), so the
+        # keep-apart distances shrink to match; everywhere else the full splash spacing applies.
+        if self.mode == "hold":
+            hard, rep_start = HOLD_HARD, HOLD_REP
+        else:
+            hard, rep_start = self.hard, self.rep_start
 
         threatened = {}
         for bid in ids:
@@ -1436,12 +1540,12 @@ class Plan:
                     continue
                 dx, dy = q[i][0] - q[j][0], q[i][1] - q[j][1]
                 d = math.hypot(dx, dy)
-                if d >= self.rep_start:
+                if d >= rep_start:
                     continue
                 if tight[i]:
                     ahead = des[i][0] * (q[j][0] - q[i][0]) + des[i][1] * (q[j][1] - q[i][1])
                     if ahead > 0.0:
-                        slow = min(slow, max(0.0, (d - self.hard) / (self.rep_start - self.hard)))
+                        slow = min(slow, max(0.0, (d - hard) / (rep_start - hard)))
                     continue
                 sign = 1.0 if i > j else -1.0
                 if d < 1e-4:
@@ -1453,7 +1557,7 @@ class Plan:
                 # Sidestep a little as well as backing off, so a column of bots fans out
                 # instead of the rear ones simply stalling behind the front.
                 ux, uy = _rotate(ux, uy, sign * math.radians(40.0))
-                s = min(1.0, (self.rep_start - d) / (self.rep_start - self.hard)) * 1.5
+                s = min(1.0, (rep_start - d) / (rep_start - hard)) * 1.5
                 rx += ux * s
                 ry += uy * s
             if tight[i]:
